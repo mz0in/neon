@@ -1,11 +1,11 @@
 use crate::{
-    auth::parse_endpoint_param,
-    cancellation::CancelClosure,
-    console::errors::WakeComputeError,
-    error::{io_error, UserFacingError},
+    auth::parse_endpoint_param, cancellation::CancelClosure, console::errors::WakeComputeError,
+    context::RequestMonitoring, error::UserFacingError, metrics::NUM_DB_CONNECTIONS_GAUGE,
+    proxy::neon_option,
 };
 use futures::{FutureExt, TryFutureExt};
 use itertools::Itertools;
+use metrics::IntCounterPairGuard;
 use pq_proto::StartupMessageParams;
 use std::{io, net::SocketAddr, time::Duration};
 use thiserror::Error;
@@ -27,12 +27,9 @@ pub enum ConnectionError {
 
     #[error("{COULD_NOT_CONNECT}: {0}")]
     TlsError(#[from] native_tls::Error),
-}
 
-impl From<WakeComputeError> for ConnectionError {
-    fn from(value: WakeComputeError) -> Self {
-        io_error(value).into()
-    }
+    #[error("{COULD_NOT_CONNECT}: {0}")]
+    WakeComputeError(#[from] WakeComputeError),
 }
 
 impl UserFacingError for ConnectionError {
@@ -42,9 +39,20 @@ impl UserFacingError for ConnectionError {
             // This helps us drop irrelevant library-specific prefixes.
             // TODO: propagate severity level and other parameters.
             Postgres(err) => match err.as_db_error() {
-                Some(err) => err.message().to_owned(),
+                Some(err) => {
+                    let msg = err.message();
+
+                    if msg.starts_with("unsupported startup parameter: ")
+                        || msg.starts_with("unsupported startup parameter in options: ")
+                    {
+                        format!("{msg}. Please use unpooled connection or remove this parameter from the startup package. More details: https://neon.tech/docs/connect/connection-errors#unsupported-startup-parameter")
+                    } else {
+                        msg.to_owned()
+                    }
+                }
                 None => err.to_string(),
             },
+            WakeComputeError(err) => err.to_string_client(),
             _ => COULD_NOT_CONNECT.to_owned(),
         }
     }
@@ -227,12 +235,15 @@ pub struct PostgresConnection {
     pub params: std::collections::HashMap<String, String>,
     /// Query cancellation token.
     pub cancel_closure: CancelClosure,
+
+    _guage: IntCounterPairGuard,
 }
 
 impl ConnCfg {
     /// Connect to a corresponding compute node.
     pub async fn connect(
         &self,
+        ctx: &mut RequestMonitoring,
         allow_self_signed_compute: bool,
         timeout: Duration,
     ) -> Result<PostgresConnection, ConnectionError> {
@@ -247,6 +258,7 @@ impl ConnCfg {
 
         // connect_raw() will not use TLS if sslmode is "disable"
         let (client, connection) = self.0.connect_raw(stream, tls).await?;
+        tracing::Span::current().record("pid", &tracing::field::display(client.get_process_id()));
         let stream = connection.stream.into_inner();
 
         info!(
@@ -267,6 +279,9 @@ impl ConnCfg {
             stream,
             params,
             cancel_closure,
+            _guage: NUM_DB_CONNECTIONS_GAUGE
+                .with_label_values(&[ctx.protocol])
+                .guard(),
         };
 
         Ok(connection)
@@ -278,7 +293,7 @@ fn filtered_options(params: &StartupMessageParams) -> Option<String> {
     #[allow(unstable_name_collisions)]
     let options: String = params
         .options_raw()?
-        .filter(|opt| parse_endpoint_param(opt).is_none())
+        .filter(|opt| parse_endpoint_param(opt).is_none() && neon_option(opt).is_none())
         .intersperse(" ") // TODO: use impl from std once it's stabilized
         .collect();
 
@@ -312,6 +327,12 @@ mod tests {
         assert_eq!(filtered_options(&params).as_deref(), Some(r"\  \ "));
 
         let params = StartupMessageParams::new([("options", "project = foo")]);
+        assert_eq!(filtered_options(&params).as_deref(), Some("project = foo"));
+
+        let params = StartupMessageParams::new([(
+            "options",
+            "project = foo neon_endpoint_type:read_write   neon_lsn:0/2",
+        )]);
         assert_eq!(filtered_options(&params).as_deref(), Some("project = foo"));
     }
 }

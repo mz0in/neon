@@ -20,12 +20,17 @@
 //!
 use byteorder::{ReadBytesExt, BE};
 use bytes::{BufMut, Bytes, BytesMut};
+use either::Either;
 use hex;
 use std::{cmp::Ordering, io, result};
 use thiserror::Error;
 use tracing::error;
 
-use crate::tenant::block_io::{BlockReader, BlockWriter};
+use crate::{
+    context::{DownloadBehavior, RequestContext},
+    task_mgr::TaskKind,
+    tenant::block_io::{BlockReader, BlockWriter},
+};
 
 // The maximum size of a value stored in the B-tree. 5 bytes is enough currently.
 pub const VALUE_SZ: usize = 5;
@@ -230,14 +235,19 @@ where
     ///
     /// Read the value for given key. Returns the value, or None if it doesn't exist.
     ///
-    pub async fn get(&self, search_key: &[u8; L]) -> Result<Option<u64>> {
+    pub async fn get(&self, search_key: &[u8; L], ctx: &RequestContext) -> Result<Option<u64>> {
         let mut result: Option<u64> = None;
-        self.visit(search_key, VisitDirection::Forwards, |key, value| {
-            if key == search_key {
-                result = Some(value);
-            }
-            false
-        })
+        self.visit(
+            search_key,
+            VisitDirection::Forwards,
+            |key, value| {
+                if key == search_key {
+                    result = Some(value);
+                }
+                false
+            },
+            ctx,
+        )
         .await?;
         Ok(result)
     }
@@ -252,107 +262,85 @@ where
         search_key: &[u8; L],
         dir: VisitDirection,
         mut visitor: V,
+        ctx: &RequestContext,
     ) -> Result<bool>
     where
         V: FnMut(&[u8], u64) -> bool,
     {
-        self.search_recurse(self.root_blk, search_key, dir, &mut visitor)
-    }
+        let mut stack = Vec::new();
+        stack.push((self.root_blk, None));
+        let block_cursor = self.reader.block_cursor();
+        while let Some((node_blknum, opt_iter)) = stack.pop() {
+            // Locate the node.
+            let node_buf = block_cursor
+                .read_blk(self.start_blk + node_blknum, ctx)
+                .await?;
 
-    fn search_recurse<V>(
-        &self,
-        node_blknum: u32,
-        search_key: &[u8; L],
-        dir: VisitDirection,
-        visitor: &mut V,
-    ) -> Result<bool>
-    where
-        V: FnMut(&[u8], u64) -> bool,
-    {
-        // Locate the node.
-        let node_buf = self.reader.read_blk(self.start_blk + node_blknum)?;
+            let node = OnDiskNode::deparse(node_buf.as_ref())?;
+            let prefix_len = node.prefix_len as usize;
+            let suffix_len = node.suffix_len as usize;
 
-        let node = OnDiskNode::deparse(node_buf.as_ref())?;
-        let prefix_len = node.prefix_len as usize;
-        let suffix_len = node.suffix_len as usize;
+            assert!(node.num_children > 0);
 
-        assert!(node.num_children > 0);
+            let mut keybuf = Vec::new();
+            keybuf.extend(node.prefix);
+            keybuf.resize(prefix_len + suffix_len, 0);
 
-        let mut keybuf = Vec::new();
-        keybuf.extend(node.prefix);
-        keybuf.resize(prefix_len + suffix_len, 0);
-
-        if dir == VisitDirection::Forwards {
-            // Locate the first match
-            let mut idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
-                Ok(idx) => idx,
-                Err(idx) => {
-                    if node.level == 0 {
-                        // Imagine that the node contains the following keys:
-                        //
-                        // 1
-                        // 3  <-- idx
-                        // 5
-                        //
-                        // If the search key is '2' and there is exact match,
-                        // the binary search would return the index of key
-                        // '3'. That's cool, '3' is the first key to return.
+            let mut iter = if let Some(iter) = opt_iter {
+                iter
+            } else if dir == VisitDirection::Forwards {
+                // Locate the first match
+                let idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
+                    Ok(idx) => idx,
+                    Err(idx) => {
+                        if node.level == 0 {
+                            // Imagine that the node contains the following keys:
+                            //
+                            // 1
+                            // 3  <-- idx
+                            // 5
+                            //
+                            // If the search key is '2' and there is exact match,
+                            // the binary search would return the index of key
+                            // '3'. That's cool, '3' is the first key to return.
+                            idx
+                        } else {
+                            // This is an internal page, so each key represents a lower
+                            // bound for what's in the child page. If there is no exact
+                            // match, we have to return the *previous* entry.
+                            //
+                            // 1  <-- return this
+                            // 3  <-- idx
+                            // 5
+                            idx.saturating_sub(1)
+                        }
+                    }
+                };
+                Either::Left(idx..node.num_children.into())
+            } else {
+                let idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
+                    Ok(idx) => {
+                        // Exact match. That's the first entry to return, and walk
+                        // backwards from there.
                         idx
-                    } else {
-                        // This is an internal page, so each key represents a lower
-                        // bound for what's in the child page. If there is no exact
-                        // match, we have to return the *previous* entry.
-                        //
-                        // 1  <-- return this
-                        // 3  <-- idx
-                        // 5
-                        idx.saturating_sub(1)
                     }
-                }
-            };
-            // idx points to the first match now. Keep going from there
-            let mut key_off = idx * suffix_len;
-            while idx < node.num_children as usize {
-                let suffix = &node.keys[key_off..key_off + suffix_len];
-                keybuf[prefix_len..].copy_from_slice(suffix);
-                let value = node.value(idx);
-                #[allow(clippy::collapsible_if)]
-                if node.level == 0 {
-                    // leaf
-                    if !visitor(&keybuf, value.to_u64()) {
-                        return Ok(false);
+                    Err(idx) => {
+                        // No exact match. The binary search returned the index of the
+                        // first key that's > search_key. Back off by one, and walk
+                        // backwards from there.
+                        if let Some(idx) = idx.checked_sub(1) {
+                            idx
+                        } else {
+                            return Ok(false);
+                        }
                     }
-                } else {
-                    #[allow(clippy::collapsible_if)]
-                    if !self.search_recurse(value.to_blknum(), search_key, dir, visitor)? {
-                        return Ok(false);
-                    }
-                }
-                idx += 1;
-                key_off += suffix_len;
-            }
-        } else {
-            let mut idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
-                Ok(idx) => {
-                    // Exact match. That's the first entry to return, and walk
-                    // backwards from there. (The loop below starts from 'idx -
-                    // 1', so add one here to compensate.)
-                    idx + 1
-                }
-                Err(idx) => {
-                    // No exact match. The binary search returned the index of the
-                    // first key that's > search_key. Back off by one, and walk
-                    // backwards from there. (The loop below starts from idx - 1,
-                    // so we don't need to subtract one here)
-                    idx
-                }
+                };
+                Either::Right((0..=idx).rev())
             };
 
-            // idx points to the first match + 1 now. Keep going from there.
-            let mut key_off = idx * suffix_len;
-            while idx > 0 {
-                idx -= 1;
-                key_off -= suffix_len;
+            // idx points to the first match now. Keep going from there
+            while let Some(idx) = iter.next() {
+                let key_off = idx * suffix_len;
                 let suffix = &node.keys[key_off..key_off + suffix_len];
                 keybuf[prefix_len..].copy_from_slice(suffix);
                 let value = node.value(idx);
@@ -363,12 +351,8 @@ where
                         return Ok(false);
                     }
                 } else {
-                    #[allow(clippy::collapsible_if)]
-                    if !self.search_recurse(value.to_blknum(), search_key, dir, visitor)? {
-                        return Ok(false);
-                    }
-                }
-                if idx == 0 {
+                    stack.push((node_blknum, Some(iter)));
+                    stack.push((value.to_blknum(), None));
                     break;
                 }
             }
@@ -379,11 +363,14 @@ where
     #[allow(dead_code)]
     pub async fn dump(&self) -> Result<()> {
         let mut stack = Vec::new();
+        let ctx = RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error);
 
         stack.push((self.root_blk, String::new(), 0, 0, 0));
 
+        let block_cursor = self.reader.block_cursor();
+
         while let Some((blknum, path, depth, child_idx, key_off)) = stack.pop() {
-            let blk = self.reader.read_blk(self.start_blk + blknum)?;
+            let blk = block_cursor.read_blk(self.start_blk + blknum, &ctx).await?;
             let buf: &[u8] = blk.as_ref();
             let node = OnDiskNode::<L>::deparse(buf)?;
 
@@ -712,28 +699,32 @@ impl<const L: usize> BuildNode<L> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::context::DownloadBehavior;
+    use crate::task_mgr::TaskKind;
+    use crate::tenant::block_io::{BlockCursor, BlockLease, BlockReaderRef};
     use rand::Rng;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Default)]
-    struct TestDisk {
+    pub(crate) struct TestDisk {
         blocks: Vec<Bytes>,
     }
     impl TestDisk {
         fn new() -> Self {
             Self::default()
         }
-    }
-    impl BlockReader for TestDisk {
-        type BlockLease = std::rc::Rc<[u8; PAGE_SZ]>;
-
-        fn read_blk(&self, blknum: u32) -> io::Result<Self::BlockLease> {
+        pub(crate) fn read_blk(&self, blknum: u32) -> io::Result<BlockLease> {
             let mut buf = [0u8; PAGE_SZ];
             buf.copy_from_slice(&self.blocks[blknum as usize]);
-            Ok(std::rc::Rc::new(buf))
+            Ok(std::sync::Arc::new(buf).into())
+        }
+    }
+    impl BlockReader for TestDisk {
+        fn block_cursor(&self) -> BlockCursor<'_> {
+            BlockCursor::new(BlockReaderRef::TestDisk(self))
         }
     }
     impl BlockWriter for &mut TestDisk {
@@ -748,6 +739,8 @@ mod tests {
     async fn basic() -> Result<()> {
         let mut disk = TestDisk::new();
         let mut writer = DiskBtreeBuilder::<_, 6>::new(&mut disk);
+
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
 
         let all_keys: Vec<&[u8; 6]> = vec![
             b"xaaaaa", b"xaaaba", b"xaaaca", b"xabaaa", b"xababa", b"xabaca", b"xabada", b"xabadb",
@@ -769,12 +762,12 @@ mod tests {
 
         // Test the `get` function on all the keys.
         for (key, val) in all_data.iter() {
-            assert_eq!(reader.get(key).await?, Some(*val));
+            assert_eq!(reader.get(key, &ctx).await?, Some(*val));
         }
         // And on some keys that don't exist
-        assert_eq!(reader.get(b"aaaaaa").await?, None);
-        assert_eq!(reader.get(b"zzzzzz").await?, None);
-        assert_eq!(reader.get(b"xaaabx").await?, None);
+        assert_eq!(reader.get(b"aaaaaa", &ctx).await?, None);
+        assert_eq!(reader.get(b"zzzzzz", &ctx).await?, None);
+        assert_eq!(reader.get(b"xaaabx", &ctx).await?, None);
 
         // Test search with `visit` function
         let search_key = b"xabaaa";
@@ -786,10 +779,15 @@ mod tests {
 
         let mut data = Vec::new();
         reader
-            .visit(search_key, VisitDirection::Forwards, |key, value| {
-                data.push((key.to_vec(), value));
-                true
-            })
+            .visit(
+                search_key,
+                VisitDirection::Forwards,
+                |key, value| {
+                    data.push((key.to_vec(), value));
+                    true
+                },
+                &ctx,
+            )
             .await?;
         assert_eq!(data, expected);
 
@@ -802,18 +800,28 @@ mod tests {
         expected.reverse();
         let mut data = Vec::new();
         reader
-            .visit(search_key, VisitDirection::Backwards, |key, value| {
-                data.push((key.to_vec(), value));
-                true
-            })
+            .visit(
+                search_key,
+                VisitDirection::Backwards,
+                |key, value| {
+                    data.push((key.to_vec(), value));
+                    true
+                },
+                &ctx,
+            )
             .await?;
         assert_eq!(data, expected);
 
         // Backward scan where nothing matches
         reader
-            .visit(b"aaaaaa", VisitDirection::Backwards, |key, value| {
-                panic!("found unexpected key {}: {}", hex::encode(key), value);
-            })
+            .visit(
+                b"aaaaaa",
+                VisitDirection::Backwards,
+                |key, value| {
+                    panic!("found unexpected key {}: {}", hex::encode(key), value);
+                },
+                &ctx,
+            )
             .await?;
 
         // Full scan
@@ -823,10 +831,15 @@ mod tests {
             .collect();
         let mut data = Vec::new();
         reader
-            .visit(&[0u8; 6], VisitDirection::Forwards, |key, value| {
-                data.push((key.to_vec(), value));
-                true
-            })
+            .visit(
+                &[0u8; 6],
+                VisitDirection::Forwards,
+                |key, value| {
+                    data.push((key.to_vec(), value));
+                    true
+                },
+                &ctx,
+            )
             .await?;
         assert_eq!(data, expected);
 
@@ -837,6 +850,7 @@ mod tests {
     async fn lots_of_keys() -> Result<()> {
         let mut disk = TestDisk::new();
         let mut writer = DiskBtreeBuilder::<_, 8>::new(&mut disk);
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
 
         const NUM_KEYS: u64 = 1000;
 
@@ -875,14 +889,14 @@ mod tests {
         for search_key_int in 0..(NUM_KEYS * 2 + 10) {
             let search_key = u64::to_be_bytes(search_key_int);
             assert_eq!(
-                reader.get(&search_key).await?,
+                reader.get(&search_key, &ctx).await?,
                 all_data.get(&search_key_int).cloned()
             );
 
             // Test a forward scan starting with this key
             result.lock().unwrap().clear();
             reader
-                .visit(&search_key, VisitDirection::Forwards, take_ten)
+                .visit(&search_key, VisitDirection::Forwards, take_ten, &ctx)
                 .await?;
             let expected = all_data
                 .range(search_key_int..)
@@ -894,7 +908,7 @@ mod tests {
             // And a backwards scan
             result.lock().unwrap().clear();
             reader
-                .visit(&search_key, VisitDirection::Backwards, take_ten)
+                .visit(&search_key, VisitDirection::Backwards, take_ten, &ctx)
                 .await?;
             let expected = all_data
                 .range(..=search_key_int)
@@ -910,7 +924,7 @@ mod tests {
         limit.store(usize::MAX, Ordering::Relaxed);
         result.lock().unwrap().clear();
         reader
-            .visit(&search_key, VisitDirection::Forwards, take_ten)
+            .visit(&search_key, VisitDirection::Forwards, take_ten, &ctx)
             .await?;
         let expected = all_data
             .iter()
@@ -923,7 +937,7 @@ mod tests {
         limit.store(usize::MAX, Ordering::Relaxed);
         result.lock().unwrap().clear();
         reader
-            .visit(&search_key, VisitDirection::Backwards, take_ten)
+            .visit(&search_key, VisitDirection::Backwards, take_ten, &ctx)
             .await?;
         let expected = all_data
             .iter()
@@ -937,6 +951,8 @@ mod tests {
 
     #[tokio::test]
     async fn random_data() -> Result<()> {
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+
         // Generate random keys with exponential distribution, to
         // exercise the prefix compression
         const NUM_KEYS: usize = 100000;
@@ -963,22 +979,24 @@ mod tests {
         // Test get() operation on all the keys
         for (&key, &val) in all_data.iter() {
             let search_key = u128::to_be_bytes(key);
-            assert_eq!(reader.get(&search_key).await?, Some(val));
+            assert_eq!(reader.get(&search_key, &ctx).await?, Some(val));
         }
 
         // Test get() operations on random keys, most of which will not exist
         for _ in 0..100000 {
             let key_int = rand::thread_rng().gen::<u128>();
             let search_key = u128::to_be_bytes(key_int);
-            assert!(reader.get(&search_key).await? == all_data.get(&key_int).cloned());
+            assert!(reader.get(&search_key, &ctx).await? == all_data.get(&key_int).cloned());
         }
 
         // Test boundary cases
         assert!(
-            reader.get(&u128::to_be_bytes(u128::MIN)).await? == all_data.get(&u128::MIN).cloned()
+            reader.get(&u128::to_be_bytes(u128::MIN), &ctx).await?
+                == all_data.get(&u128::MIN).cloned()
         );
         assert!(
-            reader.get(&u128::to_be_bytes(u128::MAX)).await? == all_data.get(&u128::MAX).cloned()
+            reader.get(&u128::to_be_bytes(u128::MAX), &ctx).await?
+                == all_data.get(&u128::MAX).cloned()
         );
 
         Ok(())
@@ -1009,6 +1027,7 @@ mod tests {
         // Build a tree from it
         let mut disk = TestDisk::new();
         let mut writer = DiskBtreeBuilder::<_, 26>::new(&mut disk);
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
 
         for (key, val) in disk_btree_test_data::TEST_DATA {
             writer.append(&key, val)?;
@@ -1021,16 +1040,21 @@ mod tests {
 
         // Test get() operation on all the keys
         for (key, val) in disk_btree_test_data::TEST_DATA {
-            assert_eq!(reader.get(&key).await?, Some(val));
+            assert_eq!(reader.get(&key, &ctx).await?, Some(val));
         }
 
         // Test full scan
         let mut count = 0;
         reader
-            .visit(&[0u8; 26], VisitDirection::Forwards, |_key, _value| {
-                count += 1;
-                true
-            })
+            .visit(
+                &[0u8; 26],
+                VisitDirection::Forwards,
+                |_key, _value| {
+                    count += 1;
+                    true
+                },
+                &ctx,
+            )
             .await?;
         assert_eq!(count, disk_btree_test_data::TEST_DATA.len());
 

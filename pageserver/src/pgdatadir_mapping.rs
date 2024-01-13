@@ -11,27 +11,51 @@ use crate::context::RequestContext;
 use crate::keyspace::{KeySpace, KeySpaceAccum};
 use crate::repository::*;
 use crate::walrecord::NeonWalRecord;
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use bytes::{Buf, Bytes};
-use pageserver_api::reltag::{RelTag, SlruKind};
+use pageserver_api::key::is_rel_block_key;
+use pageserver_api::reltag::{BlockNumber, RelTag, SlruKind};
 use postgres_ffi::relfile_utils::{FSM_FORKNUM, VISIBILITYMAP_FORKNUM};
 use postgres_ffi::BLCKSZ;
 use postgres_ffi::{Oid, TimestampTz, TransactionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::ops::Range;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
+use utils::bin_ser::DeserializeError;
 use utils::{bin_ser::BeSer, lsn::Lsn};
-
-/// Block number within a relation or SLRU. This matches PostgreSQL's BlockNumber type.
-pub type BlockNumber = u32;
 
 #[derive(Debug)]
 pub enum LsnForTimestamp {
+    /// Found commits both before and after the given timestamp
     Present(Lsn),
+
+    /// Found no commits after the given timestamp, this means
+    /// that the newest data in the branch is older than the given
+    /// timestamp.
+    ///
+    /// All commits <= LSN happened before the given timestamp
     Future(Lsn),
+
+    /// The queried timestamp is past our horizon we look back at (PITR)
+    ///
+    /// All commits > LSN happened after the given timestamp,
+    /// but any commits < LSN might have happened before or after
+    /// the given timestamp. We don't know because no data before
+    /// the given lsn is available.
     Past(Lsn),
+
+    /// We have found no commit with a timestamp,
+    /// so we can't return anything meaningful.
+    ///
+    /// The associated LSN is the lower bound value we can safely
+    /// create branches on, but no statement is made if it is
+    /// older or newer than the timestamp.
+    ///
+    /// This variant can e.g. be returned right after a
+    /// cluster import.
     NoData(Lsn),
 }
 
@@ -41,6 +65,36 @@ pub enum CalculateLogicalSizeError {
     Cancelled,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CollectKeySpaceError {
+    #[error(transparent)]
+    Decode(#[from] DeserializeError),
+    #[error(transparent)]
+    PageRead(PageReconstructError),
+    #[error("cancelled")]
+    Cancelled,
+}
+
+impl From<PageReconstructError> for CollectKeySpaceError {
+    fn from(err: PageReconstructError) -> Self {
+        match err {
+            PageReconstructError::Cancelled => Self::Cancelled,
+            err => Self::PageRead(err),
+        }
+    }
+}
+
+impl From<PageReconstructError> for CalculateLogicalSizeError {
+    fn from(pre: PageReconstructError) -> Self {
+        match pre {
+            PageReconstructError::AncestorStopping(_) | PageReconstructError::Cancelled => {
+                Self::Cancelled
+            }
+            _ => Self::Other(pre.into()),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +144,7 @@ impl Timeline {
     {
         DatadirModification {
             tline: self,
+            pending_lsns: Vec::new(),
             pending_updates: HashMap::new(),
             pending_deletions: Vec::new(),
             pending_nblocks: 0,
@@ -102,11 +157,11 @@ impl Timeline {
     //------------------------------------------------------------------------------
 
     /// Look up given page version.
-    pub async fn get_rel_page_at_lsn(
+    pub(crate) async fn get_rel_page_at_lsn(
         &self,
         tag: RelTag,
         blknum: BlockNumber,
-        lsn: Lsn,
+        version: Version<'_>,
         latest: bool,
         ctx: &RequestContext,
     ) -> Result<Bytes, PageReconstructError> {
@@ -116,44 +171,47 @@ impl Timeline {
             ));
         }
 
-        let nblocks = self.get_rel_size(tag, lsn, latest, ctx).await?;
+        let nblocks = self.get_rel_size(tag, version, latest, ctx).await?;
         if blknum >= nblocks {
             debug!(
                 "read beyond EOF at {} blk {} at {}, size is {}: returning all-zeros page",
-                tag, blknum, lsn, nblocks
+                tag,
+                blknum,
+                version.get_lsn(),
+                nblocks
             );
             return Ok(ZERO_PAGE.clone());
         }
 
         let key = rel_block_to_key(tag, blknum);
-        self.get(key, lsn, ctx).await
+        version.get(self, key, ctx).await
     }
 
     // Get size of a database in blocks
-    pub async fn get_db_size(
+    pub(crate) async fn get_db_size(
         &self,
         spcnode: Oid,
         dbnode: Oid,
-        lsn: Lsn,
+        version: Version<'_>,
         latest: bool,
         ctx: &RequestContext,
     ) -> Result<usize, PageReconstructError> {
         let mut total_blocks = 0;
 
-        let rels = self.list_rels(spcnode, dbnode, lsn, ctx).await?;
+        let rels = self.list_rels(spcnode, dbnode, version, ctx).await?;
 
         for rel in rels {
-            let n_blocks = self.get_rel_size(rel, lsn, latest, ctx).await?;
+            let n_blocks = self.get_rel_size(rel, version, latest, ctx).await?;
             total_blocks += n_blocks as usize;
         }
         Ok(total_blocks)
     }
 
     /// Get size of a relation file
-    pub async fn get_rel_size(
+    pub(crate) async fn get_rel_size(
         &self,
         tag: RelTag,
-        lsn: Lsn,
+        version: Version<'_>,
         latest: bool,
         ctx: &RequestContext,
     ) -> Result<BlockNumber, PageReconstructError> {
@@ -163,12 +221,12 @@ impl Timeline {
             ));
         }
 
-        if let Some(nblocks) = self.get_cached_rel_size(&tag, lsn) {
+        if let Some(nblocks) = self.get_cached_rel_size(&tag, version.get_lsn()) {
             return Ok(nblocks);
         }
 
         if (tag.forknum == FSM_FORKNUM || tag.forknum == VISIBILITYMAP_FORKNUM)
-            && !self.get_rel_exists(tag, lsn, latest, ctx).await?
+            && !self.get_rel_exists(tag, version, latest, ctx).await?
         {
             // FIXME: Postgres sometimes calls smgrcreate() to create
             // FSM, and smgrnblocks() on it immediately afterwards,
@@ -178,7 +236,7 @@ impl Timeline {
         }
 
         let key = rel_size_to_key(tag);
-        let mut buf = self.get(key, lsn, ctx).await?;
+        let mut buf = version.get(self, key, ctx).await?;
         let nblocks = buf.get_u32_le();
 
         if latest {
@@ -189,16 +247,16 @@ impl Timeline {
             // latest=true, then it can not cause cache corruption, because with latest=true
             // pageserver choose max(request_lsn, last_written_lsn) and so cached value will be
             // associated with most recent value of LSN.
-            self.update_cached_rel_size(tag, lsn, nblocks);
+            self.update_cached_rel_size(tag, version.get_lsn(), nblocks);
         }
         Ok(nblocks)
     }
 
     /// Does relation exist?
-    pub async fn get_rel_exists(
+    pub(crate) async fn get_rel_exists(
         &self,
         tag: RelTag,
-        lsn: Lsn,
+        version: Version<'_>,
         _latest: bool,
         ctx: &RequestContext,
     ) -> Result<bool, PageReconstructError> {
@@ -209,12 +267,12 @@ impl Timeline {
         }
 
         // first try to lookup relation in cache
-        if let Some(_nblocks) = self.get_cached_rel_size(&tag, lsn) {
+        if let Some(_nblocks) = self.get_cached_rel_size(&tag, version.get_lsn()) {
             return Ok(true);
         }
         // fetch directory listing
         let key = rel_dir_to_key(tag.spcnode, tag.dbnode);
-        let buf = self.get(key, lsn, ctx).await?;
+        let buf = version.get(self, key, ctx).await?;
 
         match RelDirectory::des(&buf).context("deserialization failure") {
             Ok(dir) => {
@@ -226,16 +284,20 @@ impl Timeline {
     }
 
     /// Get a list of all existing relations in given tablespace and database.
-    pub async fn list_rels(
+    ///
+    /// # Cancel-Safety
+    ///
+    /// This method is cancellation-safe.
+    pub(crate) async fn list_rels(
         &self,
         spcnode: Oid,
         dbnode: Oid,
-        lsn: Lsn,
+        version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<HashSet<RelTag>, PageReconstructError> {
         // fetch directory listing
         let key = rel_dir_to_key(spcnode, dbnode);
-        let buf = self.get(key, lsn, ctx).await?;
+        let buf = version.get(self, key, ctx).await?;
 
         match RelDirectory::des(&buf).context("deserialization failure") {
             Ok(dir) => {
@@ -254,7 +316,7 @@ impl Timeline {
     }
 
     /// Look up given SLRU page version.
-    pub async fn get_slru_page_at_lsn(
+    pub(crate) async fn get_slru_page_at_lsn(
         &self,
         kind: SlruKind,
         segno: u32,
@@ -267,29 +329,29 @@ impl Timeline {
     }
 
     /// Get size of an SLRU segment
-    pub async fn get_slru_segment_size(
+    pub(crate) async fn get_slru_segment_size(
         &self,
         kind: SlruKind,
         segno: u32,
-        lsn: Lsn,
+        version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<BlockNumber, PageReconstructError> {
         let key = slru_segment_size_to_key(kind, segno);
-        let mut buf = self.get(key, lsn, ctx).await?;
+        let mut buf = version.get(self, key, ctx).await?;
         Ok(buf.get_u32_le())
     }
 
     /// Get size of an SLRU segment
-    pub async fn get_slru_segment_exists(
+    pub(crate) async fn get_slru_segment_exists(
         &self,
         kind: SlruKind,
         segno: u32,
-        lsn: Lsn,
+        version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<bool, PageReconstructError> {
         // fetch directory listing
         let key = slru_dir_to_key(kind);
-        let buf = self.get(key, lsn, ctx).await?;
+        let buf = version.get(self, key, ctx).await?;
 
         match SlruSegmentDirectory::des(&buf).context("deserialization failure") {
             Ok(dir) => {
@@ -307,13 +369,18 @@ impl Timeline {
     /// so it's not well defined which LSN you get if there were multiple commits
     /// "in flight" at that point in time.
     ///
-    pub async fn find_lsn_for_timestamp(
+    pub(crate) async fn find_lsn_for_timestamp(
         &self,
         search_timestamp: TimestampTz,
+        cancel: &CancellationToken,
         ctx: &RequestContext,
     ) -> Result<LsnForTimestamp, PageReconstructError> {
         let gc_cutoff_lsn_guard = self.get_latest_gc_cutoff_lsn();
-        let min_lsn = *gc_cutoff_lsn_guard;
+        // We use this method to figure out the branching LSN for the new branch, but the
+        // GC cutoff could be before the branching point and we cannot create a new branch
+        // with LSN < `ancestor_lsn`. Thus, pick the maximum of these two to be
+        // on the safe side.
+        let min_lsn = std::cmp::max(*gc_cutoff_lsn_guard, self.get_ancestor_lsn());
         let max_lsn = self.get_last_record_lsn();
 
         // LSNs are always 8-byte aligned. low/mid/high represent the
@@ -324,6 +391,9 @@ impl Timeline {
         let mut found_smaller = false;
         let mut found_larger = false;
         while low < high {
+            if cancel.is_cancelled() {
+                return Err(PageReconstructError::Cancelled);
+            }
             // cannot overflow, high and low are both smaller than u64::MAX / 2
             let mid = (high + low) / 2;
 
@@ -343,41 +413,43 @@ impl Timeline {
                 low = mid + 1;
             }
         }
+        // If `found_smaller == true`, `low = t + 1` where `t` is the target LSN,
+        // so the LSN of the last commit record before or at `search_timestamp`.
+        // Remove one from `low` to get `t`.
+        //
+        // FIXME: it would be better to get the LSN of the previous commit.
+        // Otherwise, if you restore to the returned LSN, the database will
+        // include physical changes from later commits that will be marked
+        // as aborted, and will need to be vacuumed away.
+        let commit_lsn = Lsn((low - 1) * 8);
         match (found_smaller, found_larger) {
             (false, false) => {
                 // This can happen if no commit records have been processed yet, e.g.
                 // just after importing a cluster.
-                Ok(LsnForTimestamp::NoData(max_lsn))
-            }
-            (true, false) => {
-                // Didn't find any commit timestamps larger than the request
-                Ok(LsnForTimestamp::Future(max_lsn))
+                Ok(LsnForTimestamp::NoData(min_lsn))
             }
             (false, true) => {
                 // Didn't find any commit timestamps smaller than the request
-                Ok(LsnForTimestamp::Past(max_lsn))
+                Ok(LsnForTimestamp::Past(min_lsn))
             }
-            (true, true) => {
-                // low is the LSN of the first commit record *after* the search_timestamp,
-                // Back off by one to get to the point just before the commit.
-                //
-                // FIXME: it would be better to get the LSN of the previous commit.
-                // Otherwise, if you restore to the returned LSN, the database will
-                // include physical changes from later commits that will be marked
-                // as aborted, and will need to be vacuumed away.
-                Ok(LsnForTimestamp::Present(Lsn((low - 1) * 8)))
+            (true, false) => {
+                // Only found commits with timestamps smaller than the request.
+                // It's still a valid case for branch creation, return it.
+                // And `update_gc_info()` ignores LSN for a `LsnForTimestamp::Future`
+                // case, anyway.
+                Ok(LsnForTimestamp::Future(commit_lsn))
             }
+            (true, true) => Ok(LsnForTimestamp::Present(commit_lsn)),
         }
     }
 
-    ///
     /// Subroutine of find_lsn_for_timestamp(). Returns true, if there are any
     /// commits that committed after 'search_timestamp', at LSN 'probe_lsn'.
     ///
     /// Additionally, sets 'found_smaller'/'found_Larger, if encounters any commits
     /// with a smaller/larger timestamp.
     ///
-    pub async fn is_latest_commit_timestamp_ge_than(
+    pub(crate) async fn is_latest_commit_timestamp_ge_than(
         &self,
         search_timestamp: TimestampTz,
         probe_lsn: Lsn,
@@ -385,12 +457,56 @@ impl Timeline {
         found_larger: &mut bool,
         ctx: &RequestContext,
     ) -> Result<bool, PageReconstructError> {
+        self.map_all_timestamps(probe_lsn, ctx, |timestamp| {
+            if timestamp >= search_timestamp {
+                *found_larger = true;
+                return ControlFlow::Break(true);
+            } else {
+                *found_smaller = true;
+            }
+            ControlFlow::Continue(())
+        })
+        .await
+    }
+
+    /// Obtain the possible timestamp range for the given lsn.
+    ///
+    /// If the lsn has no timestamps, returns None. returns `(min, max, median)` if it has timestamps.
+    pub(crate) async fn get_timestamp_for_lsn(
+        &self,
+        probe_lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<Option<TimestampTz>, PageReconstructError> {
+        let mut max: Option<TimestampTz> = None;
+        self.map_all_timestamps(probe_lsn, ctx, |timestamp| {
+            if let Some(max_prev) = max {
+                max = Some(max_prev.max(timestamp));
+            } else {
+                max = Some(timestamp);
+            }
+            ControlFlow::Continue(())
+        })
+        .await?;
+
+        Ok(max)
+    }
+
+    /// Runs the given function on all the timestamps for a given lsn
+    ///
+    /// The return value is either given by the closure, or set to the `Default`
+    /// impl's output.
+    async fn map_all_timestamps<T: Default>(
+        &self,
+        probe_lsn: Lsn,
+        ctx: &RequestContext,
+        mut f: impl FnMut(TimestampTz) -> ControlFlow<T>,
+    ) -> Result<T, PageReconstructError> {
         for segno in self
-            .list_slru_segments(SlruKind::Clog, probe_lsn, ctx)
+            .list_slru_segments(SlruKind::Clog, Version::Lsn(probe_lsn), ctx)
             .await?
         {
             let nblocks = self
-                .get_slru_segment_size(SlruKind::Clog, segno, probe_lsn, ctx)
+                .get_slru_segment_size(SlruKind::Clog, segno, Version::Lsn(probe_lsn), ctx)
                 .await?;
             for blknum in (0..nblocks).rev() {
                 let clog_page = self
@@ -402,49 +518,47 @@ impl Timeline {
                     timestamp_bytes.copy_from_slice(&clog_page[BLCKSZ as usize..]);
                     let timestamp = TimestampTz::from_be_bytes(timestamp_bytes);
 
-                    if timestamp >= search_timestamp {
-                        *found_larger = true;
-                        return Ok(true);
-                    } else {
-                        *found_smaller = true;
+                    match f(timestamp) {
+                        ControlFlow::Break(b) => return Ok(b),
+                        ControlFlow::Continue(()) => (),
                     }
                 }
             }
         }
-        Ok(false)
+        Ok(Default::default())
     }
 
     /// Get a list of SLRU segments
-    pub async fn list_slru_segments(
+    pub(crate) async fn list_slru_segments(
         &self,
         kind: SlruKind,
-        lsn: Lsn,
+        version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<HashSet<u32>, PageReconstructError> {
         // fetch directory entry
         let key = slru_dir_to_key(kind);
 
-        let buf = self.get(key, lsn, ctx).await?;
+        let buf = version.get(self, key, ctx).await?;
         match SlruSegmentDirectory::des(&buf).context("deserialization failure") {
             Ok(dir) => Ok(dir.segments),
             Err(e) => Err(PageReconstructError::from(e)),
         }
     }
 
-    pub async fn get_relmap_file(
+    pub(crate) async fn get_relmap_file(
         &self,
         spcnode: Oid,
         dbnode: Oid,
-        lsn: Lsn,
+        version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<Bytes, PageReconstructError> {
         let key = relmap_file_key(spcnode, dbnode);
 
-        let buf = self.get(key, lsn, ctx).await?;
+        let buf = version.get(self, key, ctx).await?;
         Ok(buf)
     }
 
-    pub async fn list_dbdirs(
+    pub(crate) async fn list_dbdirs(
         &self,
         lsn: Lsn,
         ctx: &RequestContext,
@@ -458,7 +572,7 @@ impl Timeline {
         }
     }
 
-    pub async fn get_twophase_file(
+    pub(crate) async fn get_twophase_file(
         &self,
         xid: TransactionId,
         lsn: Lsn,
@@ -469,7 +583,7 @@ impl Timeline {
         Ok(buf)
     }
 
-    pub async fn list_twophase_files(
+    pub(crate) async fn list_twophase_files(
         &self,
         lsn: Lsn,
         ctx: &RequestContext,
@@ -483,7 +597,7 @@ impl Timeline {
         }
     }
 
-    pub async fn get_control_file(
+    pub(crate) async fn get_control_file(
         &self,
         lsn: Lsn,
         ctx: &RequestContext,
@@ -491,7 +605,7 @@ impl Timeline {
         self.get(CONTROLFILE_KEY, lsn, ctx).await
     }
 
-    pub async fn get_checkpoint(
+    pub(crate) async fn get_checkpoint(
         &self,
         lsn: Lsn,
         ctx: &RequestContext,
@@ -499,38 +613,55 @@ impl Timeline {
         self.get(CHECKPOINT_KEY, lsn, ctx).await
     }
 
+    pub(crate) async fn list_aux_files(
+        &self,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<HashMap<String, Bytes>, PageReconstructError> {
+        match self.get(AUX_FILES_KEY, lsn, ctx).await {
+            Ok(buf) => match AuxFilesDirectory::des(&buf).context("deserialization failure") {
+                Ok(dir) => Ok(dir.files),
+                Err(e) => Err(PageReconstructError::from(e)),
+            },
+            Err(e) => {
+                // This is expected: historical databases do not have the key.
+                debug!("Failed to get info about AUX files: {}", e);
+                Ok(HashMap::new())
+            }
+        }
+    }
+
     /// Does the same as get_current_logical_size but counted on demand.
     /// Used to initialize the logical size tracking on startup.
     ///
     /// Only relation blocks are counted currently. That excludes metadata,
     /// SLRUs, twophase files etc.
+    ///
+    /// # Cancel-Safety
+    ///
+    /// This method is cancellation-safe.
     pub async fn get_current_logical_size_non_incremental(
         &self,
         lsn: Lsn,
-        cancel: CancellationToken,
         ctx: &RequestContext,
     ) -> Result<u64, CalculateLogicalSizeError> {
         crate::tenant::debug_assert_current_span_has_tenant_and_timeline_id();
 
         // Fetch list of database dirs and iterate them
-        let buf = self.get(DBDIR_KEY, lsn, ctx).await.context("read dbdir")?;
+        let buf = self.get(DBDIR_KEY, lsn, ctx).await?;
         let dbdir = DbDirectory::des(&buf).context("deserialize db directory")?;
 
         let mut total_size: u64 = 0;
         for (spcnode, dbnode) in dbdir.dbdirs.keys() {
             for rel in self
-                .list_rels(*spcnode, *dbnode, lsn, ctx)
-                .await
-                .context("list rels")?
+                .list_rels(*spcnode, *dbnode, Version::Lsn(lsn), ctx)
+                .await?
             {
-                if cancel.is_cancelled() {
+                if self.cancel.is_cancelled() {
                     return Err(CalculateLogicalSizeError::Cancelled);
                 }
                 let relsize_key = rel_size_to_key(rel);
-                let mut buf = self
-                    .get(relsize_key, lsn, ctx)
-                    .await
-                    .with_context(|| format!("read relation size of {rel:?}"))?;
+                let mut buf = self.get(relsize_key, lsn, ctx).await?;
                 let relsize = buf.get_u32_le();
 
                 total_size += relsize as u64;
@@ -543,11 +674,11 @@ impl Timeline {
     /// Get a KeySpace that covers all the Keys that are in use at the given LSN.
     /// Anything that's not listed maybe removed from the underlying storage (from
     /// that LSN forwards).
-    pub async fn collect_keyspace(
+    pub(crate) async fn collect_keyspace(
         &self,
         lsn: Lsn,
         ctx: &RequestContext,
-    ) -> anyhow::Result<KeySpace> {
+    ) -> Result<KeySpace, CollectKeySpaceError> {
         // Iterate through key ranges, greedily packing them into partitions
         let mut result = KeySpaceAccum::new();
 
@@ -556,7 +687,7 @@ impl Timeline {
 
         // Fetch list of database dirs and iterate them
         let buf = self.get(DBDIR_KEY, lsn, ctx).await?;
-        let dbdir = DbDirectory::des(&buf).context("deserialization failure")?;
+        let dbdir = DbDirectory::des(&buf)?;
 
         let mut dbs: Vec<(Oid, Oid)> = dbdir.dbdirs.keys().cloned().collect();
         dbs.sort_unstable();
@@ -565,7 +696,7 @@ impl Timeline {
             result.add_key(rel_dir_to_key(spcnode, dbnode));
 
             let mut rels: Vec<RelTag> = self
-                .list_rels(spcnode, dbnode, lsn, ctx)
+                .list_rels(spcnode, dbnode, Version::Lsn(lsn), ctx)
                 .await?
                 .into_iter()
                 .collect();
@@ -589,7 +720,7 @@ impl Timeline {
             let slrudir_key = slru_dir_to_key(kind);
             result.add_key(slrudir_key);
             let buf = self.get(slrudir_key, lsn, ctx).await?;
-            let dir = SlruSegmentDirectory::des(&buf).context("deserialization failure")?;
+            let dir = SlruSegmentDirectory::des(&buf)?;
             let mut segments: Vec<u32> = dir.segments.iter().cloned().collect();
             segments.sort_unstable();
             for segno in segments {
@@ -607,7 +738,7 @@ impl Timeline {
         // Then pg_twophase
         result.add_key(TWOPHASEDIR_KEY);
         let buf = self.get(TWOPHASEDIR_KEY, lsn, ctx).await?;
-        let twophase_dir = TwoPhaseDirectory::des(&buf).context("deserialization failure")?;
+        let twophase_dir = TwoPhaseDirectory::des(&buf)?;
         let mut xids: Vec<TransactionId> = twophase_dir.xids.iter().cloned().collect();
         xids.sort_unstable();
         for xid in xids {
@@ -616,7 +747,9 @@ impl Timeline {
 
         result.add_key(CONTROLFILE_KEY);
         result.add_key(CHECKPOINT_KEY);
-
+        if self.get(AUX_FILES_KEY, lsn, ctx).await.is_ok() {
+            result.add_key(AUX_FILES_KEY);
+        }
         Ok(result.to_keyspace())
     }
 
@@ -670,18 +803,39 @@ pub struct DatadirModification<'a> {
     /// in the state in 'tline' yet.
     pub tline: &'a Timeline,
 
-    /// Lsn assigned by begin_modification
-    pub lsn: Lsn,
+    /// Current LSN of the modification
+    lsn: Lsn,
 
     // The modifications are not applied directly to the underlying key-value store.
     // The put-functions add the modifications here, and they are flushed to the
     // underlying key-value store by the 'finish' function.
-    pending_updates: HashMap<Key, Value>,
-    pending_deletions: Vec<Range<Key>>,
+    pending_lsns: Vec<Lsn>,
+    pending_updates: HashMap<Key, Vec<(Lsn, Value)>>,
+    pending_deletions: Vec<(Range<Key>, Lsn)>,
     pending_nblocks: i64,
 }
 
 impl<'a> DatadirModification<'a> {
+    /// Get the current lsn
+    pub(crate) fn get_lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    /// Set the current lsn
+    pub(crate) fn set_lsn(&mut self, lsn: Lsn) -> anyhow::Result<()> {
+        ensure!(
+            lsn >= self.lsn,
+            "setting an older lsn {} than {} is not allowed",
+            lsn,
+            self.lsn
+        );
+        if lsn > self.lsn {
+            self.pending_lsns.push(self.lsn);
+            self.lsn = lsn;
+        }
+        Ok(())
+    }
+
     /// Initialize a completely new repository.
     ///
     /// This inserts the directory metadata entries that are assumed to
@@ -691,6 +845,9 @@ impl<'a> DatadirModification<'a> {
             dbdirs: HashMap::new(),
         })?;
         self.put(DBDIR_KEY, Value::Image(buf.into()));
+
+        // Create AuxFilesDirectory
+        self.init_aux_dir()?;
 
         let buf = TwoPhaseDirectory::ser(&TwoPhaseDirectory {
             xids: HashSet::new(),
@@ -796,6 +953,9 @@ impl<'a> DatadirModification<'a> {
             // 'true', now write the updated 'dbdirs' map back.
             let buf = DbDirectory::ser(&dbdir)?;
             self.put(DBDIR_KEY, Value::Image(buf.into()));
+
+            // Create AuxFilesDirectory as well
+            self.init_aux_dir()?;
         }
         if r.is_none() {
             // Create RelDirectory
@@ -849,11 +1009,9 @@ impl<'a> DatadirModification<'a> {
         dbnode: Oid,
         ctx: &RequestContext,
     ) -> anyhow::Result<()> {
-        let req_lsn = self.tline.get_last_record_lsn();
-
         let total_blocks = self
             .tline
-            .get_db_size(spcnode, dbnode, req_lsn, true, ctx)
+            .get_db_size(spcnode, dbnode, Version::Modified(self), true, ctx)
             .await?;
 
         // Remove entry from dbdir
@@ -942,8 +1100,11 @@ impl<'a> DatadirModification<'a> {
         ctx: &RequestContext,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(rel.relnode != 0, RelationError::InvalidRelnode);
-        let last_lsn = self.tline.get_last_record_lsn();
-        if self.tline.get_rel_exists(rel, last_lsn, true, ctx).await? {
+        if self
+            .tline
+            .get_rel_exists(rel, Version::Modified(self), true, ctx)
+            .await?
+        {
             let size_key = rel_size_to_key(rel);
             // Fetch the old size first
             let old_size = self.get(size_key, ctx).await?.get_u32_le();
@@ -1120,6 +1281,45 @@ impl<'a> DatadirModification<'a> {
         Ok(())
     }
 
+    pub fn init_aux_dir(&mut self) -> anyhow::Result<()> {
+        let buf = AuxFilesDirectory::ser(&AuxFilesDirectory {
+            files: HashMap::new(),
+        })?;
+        self.put(AUX_FILES_KEY, Value::Image(Bytes::from(buf)));
+        Ok(())
+    }
+
+    pub async fn put_file(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        ctx: &RequestContext,
+    ) -> anyhow::Result<()> {
+        let mut dir = match self.get(AUX_FILES_KEY, ctx).await {
+            Ok(buf) => AuxFilesDirectory::des(&buf)?,
+            Err(e) => {
+                // This is expected: historical databases do not have the key.
+                debug!("Failed to get info about AUX files: {}", e);
+                AuxFilesDirectory {
+                    files: HashMap::new(),
+                }
+            }
+        };
+        let path = path.to_string();
+        if content.is_empty() {
+            dir.files.remove(&path);
+        } else {
+            dir.files.insert(path, Bytes::copy_from_slice(content));
+        }
+        self.put(
+            AUX_FILES_KEY,
+            Value::Image(Bytes::from(
+                AuxFilesDirectory::ser(&dir).context("serialize")?,
+            )),
+        );
+        Ok(())
+    }
+
     ///
     /// Flush changes accumulated so far to the underlying repository.
     ///
@@ -1138,7 +1338,7 @@ impl<'a> DatadirModification<'a> {
     /// retains all the metadata, but data pages are flushed. That's again OK
     /// for bulk import, where you are just loading data pages and won't try to
     /// modify the same pages twice.
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
+    pub async fn flush(&mut self, ctx: &RequestContext) -> anyhow::Result<()> {
         // Unless we have accumulated a decent amount of changes, it's not worth it
         // to scan through the pending_updates list.
         let pending_nblocks = self.pending_nblocks;
@@ -1149,17 +1349,23 @@ impl<'a> DatadirModification<'a> {
         let writer = self.tline.writer().await;
 
         // Flush relation and  SLRU data blocks, keep metadata.
-        let mut retained_pending_updates = HashMap::new();
-        for (key, value) in self.pending_updates.drain() {
-            if is_rel_block_key(key) || is_slru_block_key(key) {
-                // This bails out on first error without modifying pending_updates.
-                // That's Ok, cf this function's doc comment.
-                writer.put(key, self.lsn, &value).await?;
-            } else {
-                retained_pending_updates.insert(key, value);
+        let mut retained_pending_updates = HashMap::<_, Vec<_>>::new();
+        for (key, values) in self.pending_updates.drain() {
+            for (lsn, value) in values {
+                if is_rel_block_key(&key) || is_slru_block_key(key) {
+                    // This bails out on first error without modifying pending_updates.
+                    // That's Ok, cf this function's doc comment.
+                    writer.put(key, lsn, &value, ctx).await?;
+                } else {
+                    retained_pending_updates
+                        .entry(key)
+                        .or_default()
+                        .push((lsn, value));
+                }
             }
         }
-        self.pending_updates.extend(retained_pending_updates);
+
+        self.pending_updates = retained_pending_updates;
 
         if pending_nblocks != 0 {
             writer.update_current_logical_size(pending_nblocks * i64::from(BLCKSZ));
@@ -1174,20 +1380,30 @@ impl<'a> DatadirModification<'a> {
     /// underlying timeline.
     /// All the modifications in this atomic update are stamped by the specified LSN.
     ///
-    pub async fn commit(&mut self) -> anyhow::Result<()> {
+    pub async fn commit(&mut self, ctx: &RequestContext) -> anyhow::Result<()> {
         let writer = self.tline.writer().await;
-        let lsn = self.lsn;
+
         let pending_nblocks = self.pending_nblocks;
         self.pending_nblocks = 0;
 
-        for (key, value) in self.pending_updates.drain() {
-            writer.put(key, lsn, &value).await?;
-        }
-        for key_range in self.pending_deletions.drain(..) {
-            writer.delete(key_range, lsn).await?;
+        if !self.pending_updates.is_empty() {
+            writer.put_batch(&self.pending_updates, ctx).await?;
+            self.pending_updates.clear();
         }
 
-        writer.finish_write(lsn);
+        if !self.pending_deletions.is_empty() {
+            writer.delete_batch(&self.pending_deletions).await?;
+            self.pending_deletions.clear();
+        }
+
+        self.pending_lsns.push(self.lsn);
+        for pending_lsn in self.pending_lsns.drain(..) {
+            // Ideally, we should be able to call writer.finish_write() only once
+            // with the highest LSN. However, the last_record_lsn variable in the
+            // timeline keeps track of the latest LSN and the immediate previous LSN
+            // so we need to record every LSN to not leave a gap between them.
+            writer.finish_write(pending_lsn);
+        }
 
         if pending_nblocks != 0 {
             writer.update_current_logical_size(pending_nblocks * i64::from(BLCKSZ));
@@ -1196,40 +1412,86 @@ impl<'a> DatadirModification<'a> {
         Ok(())
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.pending_updates.len() + self.pending_deletions.len()
+    }
+
     // Internal helper functions to batch the modifications
 
     async fn get(&self, key: Key, ctx: &RequestContext) -> Result<Bytes, PageReconstructError> {
-        // Have we already updated the same key? Read the pending updated
+        // Have we already updated the same key? Read the latest pending updated
         // version in that case.
         //
         // Note: we don't check pending_deletions. It is an error to request a
         // value that has been removed, deletion only avoids leaking storage.
-        if let Some(value) = self.pending_updates.get(&key) {
-            if let Value::Image(img) = value {
-                Ok(img.clone())
-            } else {
-                // Currently, we never need to read back a WAL record that we
-                // inserted in the same "transaction". All the metadata updates
-                // work directly with Images, and we never need to read actual
-                // data pages. We could handle this if we had to, by calling
-                // the walredo manager, but let's keep it simple for now.
-                Err(PageReconstructError::from(anyhow::anyhow!(
-                    "unexpected pending WAL record"
-                )))
+        if let Some(values) = self.pending_updates.get(&key) {
+            if let Some((_, value)) = values.last() {
+                return if let Value::Image(img) = value {
+                    Ok(img.clone())
+                } else {
+                    // Currently, we never need to read back a WAL record that we
+                    // inserted in the same "transaction". All the metadata updates
+                    // work directly with Images, and we never need to read actual
+                    // data pages. We could handle this if we had to, by calling
+                    // the walredo manager, but let's keep it simple for now.
+                    Err(PageReconstructError::from(anyhow::anyhow!(
+                        "unexpected pending WAL record"
+                    )))
+                };
             }
-        } else {
-            let lsn = Lsn::max(self.tline.get_last_record_lsn(), self.lsn);
-            self.tline.get(key, lsn, ctx).await
         }
+        let lsn = Lsn::max(self.tline.get_last_record_lsn(), self.lsn);
+        self.tline.get(key, lsn, ctx).await
     }
 
     fn put(&mut self, key: Key, val: Value) {
-        self.pending_updates.insert(key, val);
+        let values = self.pending_updates.entry(key).or_default();
+        // Replace the previous value if it exists at the same lsn
+        if let Some((last_lsn, last_value)) = values.last_mut() {
+            if *last_lsn == self.lsn {
+                *last_value = val;
+                return;
+            }
+        }
+        values.push((self.lsn, val));
     }
 
     fn delete(&mut self, key_range: Range<Key>) {
         trace!("DELETE {}-{}", key_range.start, key_range.end);
-        self.pending_deletions.push(key_range);
+        self.pending_deletions.push((key_range, self.lsn));
+    }
+}
+
+/// This struct facilitates accessing either a committed key from the timeline at a
+/// specific LSN, or the latest uncommitted key from a pending modification.
+/// During WAL ingestion, the records from multiple LSNs may be batched in the same
+/// modification before being flushed to the timeline. Hence, the routines in WalIngest
+/// need to look up the keys in the modification first before looking them up in the
+/// timeline to not miss the latest updates.
+#[derive(Clone, Copy)]
+pub enum Version<'a> {
+    Lsn(Lsn),
+    Modified(&'a DatadirModification<'a>),
+}
+
+impl<'a> Version<'a> {
+    async fn get(
+        &self,
+        timeline: &Timeline,
+        key: Key,
+        ctx: &RequestContext,
+    ) -> Result<Bytes, PageReconstructError> {
+        match self {
+            Version::Lsn(lsn) => timeline.get(key, *lsn, ctx).await,
+            Version::Modified(modification) => modification.get(key, ctx).await,
+        }
+    }
+
+    fn get_lsn(&self) -> Lsn {
+        match self {
+            Version::Lsn(lsn) => *lsn,
+            Version::Modified(modification) => modification.lsn,
+        }
     }
 }
 
@@ -1253,6 +1515,11 @@ struct RelDirectory {
     // TODO: Store it as a btree or radix tree or something else that spans multiple
     // key-value pairs, if you have a lot of relations
     rels: HashSet<(Oid, u8)>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct AuxFilesDirectory {
+    files: HashMap<String, Bytes>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1303,9 +1570,11 @@ static ZERO_PAGE: Bytes = Bytes::from_static(&[0u8; BLCKSZ as usize]);
 // 02 pg_twophase
 //
 // 03 misc
-//    controlfile
+//    Controlfile
 //    checkpoint
 //    pg_version
+//
+// 04 aux files
 //
 // Below is a full list of the keyspace allocation:
 //
@@ -1344,6 +1613,11 @@ static ZERO_PAGE: Bytes = Bytes::from_static(&[0u8; BLCKSZ as usize]);
 //
 // Checkpoint:
 // 03 00000000 00000000 00000000 00   00000001
+//
+// AuxFiles:
+// 03 00000000 00000000 00000000 00   00000002
+//
+
 //-- Section 01: relation data and metadata
 
 const DBDIR_KEY: Key = Key {
@@ -1395,7 +1669,7 @@ fn rel_dir_to_key(spcnode: Oid, dbnode: Oid) -> Key {
     }
 }
 
-fn rel_block_to_key(rel: RelTag, blknum: BlockNumber) -> Key {
+pub(crate) fn rel_block_to_key(rel: RelTag, blknum: BlockNumber) -> Key {
     Key {
         field1: 0x00,
         field2: rel.spcnode,
@@ -1567,26 +1841,23 @@ const CHECKPOINT_KEY: Key = Key {
     field6: 1,
 };
 
+const AUX_FILES_KEY: Key = Key {
+    field1: 0x03,
+    field2: 0,
+    field3: 0,
+    field4: 0,
+    field5: 0,
+    field6: 2,
+};
+
 // Reverse mappings for a few Keys.
 // These are needed by WAL redo manager.
 
-pub fn key_to_rel_block(key: Key) -> anyhow::Result<(RelTag, BlockNumber)> {
-    Ok(match key.field1 {
-        0x00 => (
-            RelTag {
-                spcnode: key.field2,
-                dbnode: key.field3,
-                relnode: key.field4,
-                forknum: key.field5,
-            },
-            key.field6,
-        ),
-        _ => anyhow::bail!("unexpected value kind 0x{:02x}", key.field1),
-    })
-}
-
-fn is_rel_block_key(key: Key) -> bool {
-    key.field1 == 0x00 && key.field4 != 0
+// AUX_FILES currently stores only data for logical replication (slots etc), and
+// we don't preserve these on a branch because safekeepers can't follow timeline
+// switch (and generally it likely should be optional), so ignore these.
+pub fn is_inherited_key(key: Key) -> bool {
+    key != AUX_FILES_KEY
 }
 
 pub fn is_rel_fsm_block_key(key: Key) -> bool {

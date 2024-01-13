@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::{Condvar, Mutex, OnceLock, RwLock};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+use std::sync::{Condvar, Mutex, RwLock};
+use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,23 +18,27 @@ use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use postgres::{Client, NoTls};
-use regex::Regex;
 use tokio;
 use tokio_postgres;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
 
 use compute_api::responses::{ComputeMetrics, ComputeStatus};
-use compute_api::spec::{ComputeMode, ComputeSpec};
+use compute_api::spec::{ComputeFeature, ComputeMode, ComputeSpec};
 use utils::measured_stream::MeasuredReader;
 
-use remote_storage::{GenericRemoteStorage, RemotePath};
+use remote_storage::{DownloadError, RemotePath};
 
+use crate::checker::create_availability_check_data;
+use crate::logger::inlinify;
 use crate::pg_helpers::*;
 use crate::spec::*;
 use crate::sync_sk::{check_if_synced, ping_safekeeper};
 use crate::{config, extension_server};
+
+pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
+pub static PG_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Compute node info shared across several `compute_ctl` threads.
 pub struct ComputeNode {
@@ -57,15 +66,15 @@ pub struct ComputeNode {
     pub state: Mutex<ComputeState>,
     /// `Condvar` to allow notifying waiters about state changes.
     pub state_changed: Condvar,
-    ///  the S3 bucket that we search for extensions in
-    pub ext_remote_storage: Option<GenericRemoteStorage>,
-    // (key: extension name, value: path to extension archive in remote storage)
-    pub ext_remote_paths: OnceLock<HashMap<String, RemotePath>>,
-    // (key: library name, value: name of extension containing this library)
-    pub library_index: OnceLock<HashMap<String, String>>,
+    /// the address of extension storage proxy gateway
+    pub ext_remote_storage: Option<String>,
     // key: ext_archive_name, value: started download time, download_completed?
     pub ext_download_progress: RwLock<HashMap<String, (DateTime<Utc>, bool)>>,
     pub build_tag: String,
+    // connection string to pgbouncer to change settings
+    pub pgbouncer_connstr: Option<String>,
+    // path to pgbouncer.ini to change settings
+    pub pgbouncer_ini_path: Option<String>,
 }
 
 // store some metrics about download size that might impact startup time
@@ -74,7 +83,6 @@ pub struct RemoteExtensionMetrics {
     num_ext_downloaded: u64,
     largest_ext_size: u64,
     total_ext_download_size: u64,
-    prep_extensions_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +188,27 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
     }
 }
 
+/// If we are a VM, returns a [`Command`] that will run in the `neon-postgres`
+/// cgroup. Otherwise returns the default `Command::new(cmd)`
+///
+/// This function should be used to start postgres, as it will start it in the
+/// neon-postgres cgroup if we are a VM. This allows autoscaling to control
+/// postgres' resource usage. The cgroup will exist in VMs because vm-builder
+/// creates it during the sysinit phase of its inittab.
+fn maybe_cgexec(cmd: &str) -> Command {
+    // The cplane sets this env var for autoscaling computes.
+    // use `var_os` so we don't have to worry about the variable being valid
+    // unicode. Should never be an concern . . . but just in case
+    if env::var_os("AUTOSCALING").is_some() {
+        let mut command = Command::new("cgexec");
+        command.args(["-g", "memory:neon-postgres"]);
+        command.arg(cmd);
+        command
+    } else {
+        Command::new(cmd)
+    }
+}
+
 /// Create special neon_superuser role, that's a slightly nerfed version of a real superuser
 /// that we give to customers
 fn create_neon_superuser(spec: &ComputeSpec, client: &mut Client) -> Result<()> {
@@ -234,7 +263,7 @@ fn create_neon_superuser(spec: &ComputeSpec, client: &mut Client) -> Result<()> 
                     IF NOT EXISTS (
                         SELECT FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser')
                     THEN
-                        CREATE ROLE neon_superuser CREATEDB CREATEROLE NOLOGIN IN ROLE pg_read_all_data, pg_write_all_data;
+                        CREATE ROLE neon_superuser CREATEDB CREATEROLE NOLOGIN REPLICATION BYPASSRLS IN ROLE pg_read_all_data, pg_write_all_data;
                         IF array_length(roles, 1) IS NOT NULL THEN
                             EXECUTE format('GRANT neon_superuser TO %s',
                                            array_to_string(ARRAY(SELECT quote_ident(x) FROM unnest(roles) as x), ', '));
@@ -251,7 +280,7 @@ fn create_neon_superuser(spec: &ComputeSpec, client: &mut Client) -> Result<()> 
             $$;"#,
         roles_decl, database_decl,
     );
-    info!("Neon superuser created:\n{}", &query);
+    info!("Neon superuser created: {}", inlinify(&query));
     client
         .simple_query(&query)
         .map_err(|e| anyhow::anyhow!(e).context(query))?;
@@ -259,6 +288,17 @@ fn create_neon_superuser(spec: &ComputeSpec, client: &mut Client) -> Result<()> 
 }
 
 impl ComputeNode {
+    /// Check that compute node has corresponding feature enabled.
+    pub fn has_feature(&self, feature: ComputeFeature) -> bool {
+        let state = self.state.lock().unwrap();
+
+        if let Some(s) = state.pspec.as_ref() {
+            s.spec.features.contains(&feature)
+        } else {
+            false
+        }
+    }
+
     pub fn set_status(&self, status: ComputeStatus) {
         let mut state = self.state.lock().unwrap();
         state.status = status;
@@ -285,7 +325,7 @@ impl ComputeNode {
     #[instrument(skip_all, fields(%lsn))]
     fn get_basebackup(&self, compute_state: &ComputeState, lsn: Lsn) -> Result<()> {
         let spec = compute_state.pspec.as_ref().expect("spec must be set");
-        let start_time = Utc::now();
+        let start_time = Instant::now();
 
         let mut config = postgres::Config::from_str(&spec.pageserver_connstr)?;
 
@@ -298,7 +338,10 @@ impl ComputeNode {
             info!("Storage auth token not set");
         }
 
+        // Connect to pageserver
         let mut client = config.connect(NoTls)?;
+        let pageserver_connect_micros = start_time.elapsed().as_micros() as u64;
+
         let basebackup_cmd = match lsn {
             // HACK We don't use compression on first start (Lsn(0)) because there's no API for it
             Lsn(0) => format!("basebackup {} {}", spec.tenant_id, spec.timeline_id),
@@ -344,13 +387,10 @@ impl ComputeNode {
         };
 
         // Report metrics
-        self.state.lock().unwrap().metrics.basebackup_bytes =
-            measured_reader.get_byte_count() as u64;
-        self.state.lock().unwrap().metrics.basebackup_ms = Utc::now()
-            .signed_duration_since(start_time)
-            .to_std()
-            .unwrap()
-            .as_millis() as u64;
+        let mut state = self.state.lock().unwrap();
+        state.metrics.pageserver_connect_micros = pageserver_connect_micros;
+        state.metrics.basebackup_bytes = measured_reader.get_byte_count() as u64;
+        state.metrics.basebackup_ms = start_time.elapsed().as_millis() as u64;
         Ok(())
     }
 
@@ -456,7 +496,7 @@ impl ComputeNode {
     pub fn sync_safekeepers(&self, storage_auth_token: Option<String>) -> Result<Lsn> {
         let start_time = Utc::now();
 
-        let sync_handle = Command::new(&self.pgbin)
+        let mut sync_handle = maybe_cgexec(&self.pgbin)
             .args(["--sync-safekeepers"])
             .env("PGDATA", &self.pgdata) // we cannot use -D in this mode
             .envs(if let Some(storage_auth_token) = &storage_auth_token {
@@ -465,15 +505,29 @@ impl ComputeNode {
                 vec![]
             })
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("postgres --sync-safekeepers failed to start");
+        SYNC_SAFEKEEPERS_PID.store(sync_handle.id(), Ordering::SeqCst);
 
         // `postgres --sync-safekeepers` will print all log output to stderr and
-        // final LSN to stdout. So we pipe only stdout, while stderr will be automatically
-        // redirected to the caller output.
+        // final LSN to stdout. So we leave stdout to collect LSN, while stderr logs
+        // will be collected in a child thread.
+        let stderr = sync_handle
+            .stderr
+            .take()
+            .expect("stderr should be captured");
+        let logs_handle = handle_postgres_logs(stderr);
+
         let sync_output = sync_handle
             .wait_with_output()
             .expect("postgres --sync-safekeepers failed");
+        SYNC_SAFEKEEPERS_PID.store(0, Ordering::SeqCst);
+
+        // Process has exited, so we can join the logs thread.
+        let _ = logs_handle
+            .join()
+            .map_err(|e| tracing::error!("log thread panicked: {:?}", e));
 
         if !sync_output.status.success() {
             anyhow::bail!(
@@ -591,7 +645,7 @@ impl ComputeNode {
 
         // Start postgres
         info!("starting postgres");
-        let mut pg = Command::new(&self.pgbin)
+        let mut pg = maybe_cgexec(&self.pgbin)
             .args(["-D", pgdata])
             .spawn()
             .expect("cannot start postgres process");
@@ -611,27 +665,34 @@ impl ComputeNode {
 
     /// Start Postgres as a child process and manage DBs/roles.
     /// After that this will hang waiting on the postmaster process to exit.
+    /// Returns a handle to the child process and a handle to the logs thread.
     #[instrument(skip_all)]
     pub fn start_postgres(
         &self,
         storage_auth_token: Option<String>,
-    ) -> Result<std::process::Child> {
+    ) -> Result<(std::process::Child, std::thread::JoinHandle<()>)> {
         let pgdata_path = Path::new(&self.pgdata);
 
         // Run postgres as a child process.
-        let mut pg = Command::new(&self.pgbin)
+        let mut pg = maybe_cgexec(&self.pgbin)
             .args(["-D", &self.pgdata])
             .envs(if let Some(storage_auth_token) = &storage_auth_token {
                 vec![("NEON_AUTH_TOKEN", storage_auth_token)]
             } else {
                 vec![]
             })
+            .stderr(Stdio::piped())
             .spawn()
             .expect("cannot start postgres process");
+        PG_PID.store(pg.id(), Ordering::SeqCst);
+
+        // Start a thread to collect logs from stderr.
+        let stderr = pg.stderr.take().expect("stderr should be captured");
+        let logs_handle = handle_postgres_logs(stderr);
 
         wait_for_postgres(&mut pg, pgdata_path)?;
 
-        Ok(pg)
+        Ok((pg, logs_handle))
     }
 
     /// Do initial configuration of the already started Postgres.
@@ -674,11 +735,14 @@ impl ComputeNode {
         // Proceed with post-startup configuration. Note, that order of operations is important.
         let spec = &compute_state.pspec.as_ref().expect("spec must be set").spec;
         create_neon_superuser(spec, &mut client)?;
+        cleanup_instance(&mut client)?;
         handle_roles(spec, &mut client)?;
         handle_databases(spec, &mut client)?;
         handle_role_deletions(spec, self.connstr.as_str(), &mut client)?;
-        handle_grants(spec, self.connstr.as_str())?;
+        handle_grants(spec, &mut client, self.connstr.as_str())?;
         handle_extensions(spec, &mut client)?;
+        handle_extension_neon(&mut client)?;
+        create_availability_check_data(&mut client)?;
 
         // 'Close' connection
         drop(client);
@@ -690,8 +754,12 @@ impl ComputeNode {
     // `pg_ctl` for start / stop, so this just seems much easier to do as we already
     // have opened connection to Postgres and superuser access.
     #[instrument(skip_all)]
-    fn pg_reload_conf(&self, client: &mut Client) -> Result<()> {
-        client.simple_query("SELECT pg_reload_conf()")?;
+    fn pg_reload_conf(&self) -> Result<()> {
+        let pgctl_bin = Path::new(&self.pgbin).parent().unwrap().join("pg_ctl");
+        Command::new(pgctl_bin)
+            .args(["reload", "-D", &self.pgdata])
+            .output()
+            .expect("cannot run pg_ctl process");
         Ok(())
     }
 
@@ -701,26 +769,62 @@ impl ComputeNode {
     pub fn reconfigure(&self) -> Result<()> {
         let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
 
+        if let Some(connstr) = &self.pgbouncer_connstr {
+            info!("tuning pgbouncer with connstr: {:?}", connstr);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create rt");
+
+            // Spawn a thread to do the tuning,
+            // so that we don't block the main thread that starts Postgres.
+            let pgbouncer_settings = spec.pgbouncer_settings.clone();
+            let connstr_clone = connstr.clone();
+            let pgbouncer_ini_path = self.pgbouncer_ini_path.clone();
+            let _handle = thread::spawn(move || {
+                let res = rt.block_on(tune_pgbouncer(
+                    pgbouncer_settings,
+                    &connstr_clone,
+                    pgbouncer_ini_path,
+                ));
+                if let Err(err) = res {
+                    error!("error while tuning pgbouncer: {err:?}");
+                }
+            });
+        }
+
         // Write new config
         let pgdata_path = Path::new(&self.pgdata);
-        config::write_postgres_conf(&pgdata_path.join("postgresql.conf"), &spec, None)?;
+        let postgresql_conf_path = pgdata_path.join("postgresql.conf");
+        config::write_postgres_conf(&postgresql_conf_path, &spec, None)?;
+        // temporarily reset max_cluster_size in config
+        // to avoid the possibility of hitting the limit, while we are reconfiguring:
+        // creating new extensions, roles, etc...
+        config::compute_ctl_temp_override_create(pgdata_path, "neon.max_cluster_size=-1")?;
+        self.pg_reload_conf()?;
 
         let mut client = Client::connect(self.connstr.as_str(), NoTls)?;
-        self.pg_reload_conf(&mut client)?;
 
         // Proceed with post-startup configuration. Note, that order of operations is important.
         // Disable DDL forwarding because control plane already knows about these roles/databases.
         if spec.mode == ComputeMode::Primary {
             client.simple_query("SET neon.forward_ddl = false")?;
+            cleanup_instance(&mut client)?;
             handle_roles(&spec, &mut client)?;
             handle_databases(&spec, &mut client)?;
             handle_role_deletions(&spec, self.connstr.as_str(), &mut client)?;
-            handle_grants(&spec, self.connstr.as_str())?;
+            handle_grants(&spec, &mut client, self.connstr.as_str())?;
             handle_extensions(&spec, &mut client)?;
+            handle_extension_neon(&mut client)?;
         }
 
         // 'Close' connection
         drop(client);
+
+        // reset max_cluster_size in config back to original value and reload config
+        config::compute_ctl_temp_override_remove(pgdata_path)?;
+        self.pg_reload_conf()?;
 
         let unknown_op = "unknown".to_string();
         let op_id = spec.operation_uuid.as_ref().unwrap_or(&unknown_op);
@@ -733,7 +837,10 @@ impl ComputeNode {
     }
 
     #[instrument(skip_all)]
-    pub fn start_compute(&self, extension_server_port: u16) -> Result<std::process::Child> {
+    pub fn start_compute(
+        &self,
+        extension_server_port: u16,
+    ) -> Result<(std::process::Child, std::thread::JoinHandle<()>)> {
         let compute_state = self.state.lock().unwrap().clone();
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         info!(
@@ -744,11 +851,45 @@ impl ComputeNode {
             pspec.timeline_id,
         );
 
+        // tune pgbouncer
+        if let Some(connstr) = &self.pgbouncer_connstr {
+            info!("tuning pgbouncer with connstr: {:?}", connstr);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create rt");
+
+            // Spawn a thread to do the tuning,
+            // so that we don't block the main thread that starts Postgres.
+            let pgbouncer_settings = pspec.spec.pgbouncer_settings.clone();
+            let connstr_clone = connstr.clone();
+            let pgbouncer_ini_path = self.pgbouncer_ini_path.clone();
+            let _handle = thread::spawn(move || {
+                let res = rt.block_on(tune_pgbouncer(
+                    pgbouncer_settings,
+                    &connstr_clone,
+                    pgbouncer_ini_path,
+                ));
+                if let Err(err) = res {
+                    error!("error while tuning pgbouncer: {err:?}");
+                }
+            });
+        }
+
+        info!(
+            "start_compute spec.remote_extensions {:?}",
+            pspec.spec.remote_extensions
+        );
+
         // This part is sync, because we need to download
         // remote shared_preload_libraries before postgres start (if any)
-        {
+        if let Some(remote_extensions) = &pspec.spec.remote_extensions {
+            // First, create control files for all availale extensions
+            extension_server::create_control_files(remote_extensions, &self.pgbin);
+
             let library_load_start_time = Utc::now();
-            let remote_ext_metrics = self.prepare_preload_libraries(&compute_state)?;
+            let remote_ext_metrics = self.prepare_preload_libraries(&pspec.spec)?;
 
             let library_load_time = Utc::now()
                 .signed_duration_since(library_load_start_time)
@@ -760,7 +901,6 @@ impl ComputeNode {
             state.metrics.num_ext_downloaded = remote_ext_metrics.num_ext_downloaded;
             state.metrics.largest_ext_size = remote_ext_metrics.largest_ext_size;
             state.metrics.total_ext_download_size = remote_ext_metrics.total_ext_download_size;
-            state.metrics.prep_extensions_ms = remote_ext_metrics.prep_extensions_ms;
             info!(
                 "Loading shared_preload_libraries took {:?}ms",
                 library_load_time
@@ -771,11 +911,21 @@ impl ComputeNode {
         self.prepare_pgdata(&compute_state, extension_server_port)?;
 
         let start_time = Utc::now();
-        let pg = self.start_postgres(pspec.storage_auth_token.clone())?;
+        let pg_process = self.start_postgres(pspec.storage_auth_token.clone())?;
 
         let config_time = Utc::now();
         if pspec.spec.mode == ComputeMode::Primary && !pspec.spec.skip_pg_catalog_updates {
+            let pgdata_path = Path::new(&self.pgdata);
+            // temporarily reset max_cluster_size in config
+            // to avoid the possibility of hitting the limit, while we are applying config:
+            // creating new extensions, roles, etc...
+            config::compute_ctl_temp_override_create(pgdata_path, "neon.max_cluster_size=-1")?;
+            self.pg_reload_conf()?;
+
             self.apply_config(&compute_state)?;
+
+            config::compute_ctl_temp_override_remove(pgdata_path)?;
+            self.pg_reload_conf()?;
         }
 
         let startup_end_time = Utc::now();
@@ -811,7 +961,17 @@ impl ComputeNode {
         };
         info!(?metrics, "compute start finished");
 
-        Ok(pg)
+        Ok(pg_process)
+    }
+
+    /// Update the `last_active` in the shared state, but ensure that it's a more recent one.
+    pub fn update_last_active(&self, last_active: Option<DateTime<Utc>>) {
+        let mut state = self.state.lock().unwrap();
+        // NB: `Some(<DateTime>)` is always greater than `None`.
+        if last_active > state.last_active {
+            state.last_active = last_active;
+            debug!("set the last compute activity time to: {:?}", last_active);
+        }
     }
 
     // Look for core dumps and collect backtraces.
@@ -917,138 +1077,103 @@ LIMIT 100",
         }
     }
 
-    // If remote extension storage is configured,
-    // download extension control files
-    pub async fn prepare_external_extensions(&self, compute_state: &ComputeState) -> Result<()> {
-        if let Some(ref ext_remote_storage) = self.ext_remote_storage {
-            let pspec = compute_state.pspec.as_ref().expect("spec must be set");
-            let spec = &pspec.spec;
-            let custom_ext = spec.custom_extensions.clone().unwrap_or(Vec::new());
-            info!("custom extensions: {:?}", &custom_ext);
-            let (ext_remote_paths, library_index) = extension_server::get_available_extensions(
-                ext_remote_storage,
-                &self.pgbin,
-                &self.pgversion,
-                &custom_ext,
-                &self.build_tag,
-            )
-            .await?;
-            self.ext_remote_paths
-                .set(ext_remote_paths)
-                .expect("this is the only time we set ext_remote_paths");
-            self.library_index
-                .set(library_index)
-                .expect("this is the only time we set library_index");
-        }
-        Ok(())
-    }
-
     // download an archive, unzip and place files in correct locations
-    pub async fn download_extension(&self, ext_name: &str, is_library: bool) -> Result<u64> {
-        match &self.ext_remote_storage {
-            None => anyhow::bail!("No remote extension storage"),
-            Some(remote_storage) => {
-                let mut real_ext_name = ext_name.to_string();
-                if is_library {
-                    // sometimes library names might have a suffix like
-                    // library.so or library.so.3. We strip this off
-                    // because library_index is based on the name without the file extension
-                    let strip_lib_suffix = Regex::new(r"\.so.*").unwrap();
-                    let lib_raw_name = strip_lib_suffix.replace(&real_ext_name, "").to_string();
-                    real_ext_name = self
-                        .library_index
-                        .get()
-                        .expect("must have already downloaded the library_index")[&lib_raw_name]
-                        .clone();
-                }
+    pub async fn download_extension(
+        &self,
+        real_ext_name: String,
+        ext_path: RemotePath,
+    ) -> Result<u64, DownloadError> {
+        let ext_remote_storage =
+            self.ext_remote_storage
+                .as_ref()
+                .ok_or(DownloadError::BadInput(anyhow::anyhow!(
+                    "Remote extensions storage is not configured",
+                )))?;
 
-                let ext_path = &self
-                    .ext_remote_paths
-                    .get()
-                    .expect("error accessing ext_remote_paths")[&real_ext_name];
-                let ext_archive_name = ext_path.object_name().expect("bad path");
+        let ext_archive_name = ext_path.object_name().expect("bad path");
 
-                let mut first_try = false;
-                if !self
-                    .ext_download_progress
-                    .read()
-                    .expect("lock err")
-                    .contains_key(ext_archive_name)
-                {
-                    self.ext_download_progress
-                        .write()
-                        .expect("lock err")
-                        .insert(ext_archive_name.to_string(), (Utc::now(), false));
-                    first_try = true;
-                }
-                let (download_start, download_completed) =
-                    self.ext_download_progress.read().expect("lock err")[ext_archive_name];
-                let start_time_delta = Utc::now()
-                    .signed_duration_since(download_start)
-                    .to_std()
-                    .unwrap()
-                    .as_millis() as u64;
-
-                // how long to wait for extension download if it was started by another process
-                const HANG_TIMEOUT: u64 = 3000; // milliseconds
-
-                if download_completed {
-                    info!("extension already downloaded, skipping re-download");
-                    return Ok(0);
-                } else if start_time_delta < HANG_TIMEOUT && !first_try {
-                    info!("download {ext_archive_name} already started by another process, hanging untill completion or timeout");
-                    let mut interval =
-                        tokio::time::interval(tokio::time::Duration::from_millis(500));
-                    loop {
-                        info!("waiting for download");
-                        interval.tick().await;
-                        let (_, download_completed_now) =
-                            self.ext_download_progress.read().expect("lock")[ext_archive_name];
-                        if download_completed_now {
-                            info!("download finished by whoever else downloaded it");
-                            return Ok(0);
-                        }
-                    }
-                    // NOTE: the above loop will get terminated
-                    // based on the timeout of the download function
-                }
-
-                // if extension hasn't been downloaded before or the previous
-                // attempt to download was at least HANG_TIMEOUT ms ago
-                // then we try to download it here
-                info!("downloading new extension {ext_archive_name}");
-
-                let download_size = extension_server::download_extension(
-                    &real_ext_name,
-                    ext_path,
-                    remote_storage,
-                    &self.pgbin,
-                )
-                .await;
-                self.ext_download_progress
-                    .write()
-                    .expect("bad lock")
-                    .insert(ext_archive_name.to_string(), (download_start, true));
-                download_size
-            }
+        let mut first_try = false;
+        if !self
+            .ext_download_progress
+            .read()
+            .expect("lock err")
+            .contains_key(ext_archive_name)
+        {
+            self.ext_download_progress
+                .write()
+                .expect("lock err")
+                .insert(ext_archive_name.to_string(), (Utc::now(), false));
+            first_try = true;
         }
+        let (download_start, download_completed) =
+            self.ext_download_progress.read().expect("lock err")[ext_archive_name];
+        let start_time_delta = Utc::now()
+            .signed_duration_since(download_start)
+            .to_std()
+            .unwrap()
+            .as_millis() as u64;
+
+        // how long to wait for extension download if it was started by another process
+        const HANG_TIMEOUT: u64 = 3000; // milliseconds
+
+        if download_completed {
+            info!("extension already downloaded, skipping re-download");
+            return Ok(0);
+        } else if start_time_delta < HANG_TIMEOUT && !first_try {
+            info!("download {ext_archive_name} already started by another process, hanging untill completion or timeout");
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            loop {
+                info!("waiting for download");
+                interval.tick().await;
+                let (_, download_completed_now) =
+                    self.ext_download_progress.read().expect("lock")[ext_archive_name];
+                if download_completed_now {
+                    info!("download finished by whoever else downloaded it");
+                    return Ok(0);
+                }
+            }
+            // NOTE: the above loop will get terminated
+            // based on the timeout of the download function
+        }
+
+        // if extension hasn't been downloaded before or the previous
+        // attempt to download was at least HANG_TIMEOUT ms ago
+        // then we try to download it here
+        info!("downloading new extension {ext_archive_name}");
+
+        let download_size = extension_server::download_extension(
+            &real_ext_name,
+            &ext_path,
+            ext_remote_storage,
+            &self.pgbin,
+        )
+        .await
+        .map_err(DownloadError::Other);
+
+        self.ext_download_progress
+            .write()
+            .expect("bad lock")
+            .insert(ext_archive_name.to_string(), (download_start, true));
+
+        download_size
     }
 
     #[tokio::main]
     pub async fn prepare_preload_libraries(
         &self,
-        compute_state: &ComputeState,
+        spec: &ComputeSpec,
     ) -> Result<RemoteExtensionMetrics> {
         if self.ext_remote_storage.is_none() {
             return Ok(RemoteExtensionMetrics {
                 num_ext_downloaded: 0,
                 largest_ext_size: 0,
                 total_ext_download_size: 0,
-                prep_extensions_ms: 0,
             });
         }
-        let pspec = compute_state.pspec.as_ref().expect("spec must be set");
-        let spec = &pspec.spec;
+        let remote_extensions = spec
+            .remote_extensions
+            .as_ref()
+            .ok_or(anyhow::anyhow!("Remote extensions are not configured"))?;
 
         info!("parse shared_preload_libraries from spec.cluster.settings");
         let mut libs_vec = Vec::new();
@@ -1060,6 +1185,7 @@ LIMIT 100",
                 .collect();
         }
         info!("parse shared_preload_libraries from provided postgresql.conf");
+
         // that is used in neon_local and python tests
         if let Some(conf) = &spec.cluster.postgresql_conf {
             let conf_lines = conf.split('\n').collect::<Vec<&str>>();
@@ -1080,20 +1206,17 @@ LIMIT 100",
             libs_vec.extend(preload_libs_vec);
         }
 
-        info!("Download ext_index.json, find the extension paths");
-        let prep_ext_start_time = Utc::now();
-        self.prepare_external_extensions(compute_state).await?;
-        let prep_ext_time_delta = Utc::now()
-            .signed_duration_since(prep_ext_start_time)
-            .to_std()
-            .unwrap()
-            .as_millis() as u64;
-        info!("Prepare extensions took {prep_ext_time_delta}ms");
+        // Don't try to download libraries that are not in the index.
+        // Assume that they are already present locally.
+        libs_vec.retain(|lib| remote_extensions.library_index.contains_key(lib));
 
         info!("Downloading to shared preload libraries: {:?}", &libs_vec);
+
         let mut download_tasks = Vec::new();
         for library in &libs_vec {
-            download_tasks.push(self.download_extension(library, true));
+            let (ext_name, ext_path) =
+                remote_extensions.get_ext(library, true, &self.build_tag, &self.pgversion)?;
+            download_tasks.push(self.download_extension(ext_name, ext_path));
         }
         let results = join_all(download_tasks).await;
 
@@ -1101,11 +1224,21 @@ LIMIT 100",
             num_ext_downloaded: 0,
             largest_ext_size: 0,
             total_ext_download_size: 0,
-            prep_extensions_ms: prep_ext_time_delta,
         };
         for result in results {
-            let download_size = result?;
-            remote_ext_metrics.num_ext_downloaded += 1;
+            let download_size = match result {
+                Ok(res) => {
+                    remote_ext_metrics.num_ext_downloaded += 1;
+                    res
+                }
+                Err(err) => {
+                    // if we failed to download an extension, we don't want to fail the whole
+                    // process, but we do want to log the error
+                    error!("Failed to download extension: {}", err);
+                    0
+                }
+            };
+
             remote_ext_metrics.largest_ext_size =
                 std::cmp::max(remote_ext_metrics.largest_ext_size, download_size);
             remote_ext_metrics.total_ext_download_size += download_size;

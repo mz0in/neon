@@ -1,5 +1,8 @@
 //! `utils` is intended to be a place to put code that is shared
 //! between other crates in this repository.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+pub mod backoff;
 
 /// `Lsn` type implements common tasks on Log Sequence Numbers
 pub mod lsn;
@@ -22,8 +25,15 @@ pub mod auth;
 
 // utility functions and helper traits for unified unique id generation/serialization etc.
 pub mod id;
+
+mod hex;
+pub use hex::Hex;
+
 // http endpoint utils
 pub mod http;
+
+// definition of the Generation type for pageserver attachment APIs
+pub mod generation;
 
 // common log initialisation routine
 pub mod logging;
@@ -56,6 +66,8 @@ pub mod serde_regex;
 
 pub mod pageserver_feedback;
 
+pub mod postgres_client;
+
 pub mod tracing_span_assert;
 
 pub mod rate_limit;
@@ -66,43 +78,14 @@ pub mod completion;
 /// Reporting utilities
 pub mod error;
 
-mod failpoint_macro_helpers {
+/// async timeout helper
+pub mod timeout;
 
-    /// use with fail::cfg("$name", "return(2000)")
-    ///
-    /// The effect is similar to a "sleep(2000)" action, i.e. we sleep for the
-    /// specified time (in milliseconds). The main difference is that we use async
-    /// tokio sleep function. Another difference is that we print lines to the log,
-    /// which can be useful in tests to check that the failpoint was hit.
-    #[macro_export]
-    macro_rules! failpoint_sleep_millis_async {
-        ($name:literal) => {{
-            // If the failpoint is used with a "return" action, set should_sleep to the
-            // returned value (as string). Otherwise it's set to None.
-            let should_sleep = (|| {
-                ::fail::fail_point!($name, |x| x);
-                ::std::option::Option::None
-            })();
+pub mod sync;
 
-            // Sleep if the action was a returned value
-            if let ::std::option::Option::Some(duration_str) = should_sleep {
-                $crate::failpoint_sleep_helper($name, duration_str).await
-            }
-        }};
-    }
+pub mod failpoint_support;
 
-    // Helper function used by the macro. (A function has nicer scoping so we
-    // don't need to decorate everything with "::")
-    pub async fn failpoint_sleep_helper(name: &'static str, duration_str: String) {
-        let millis = duration_str.parse::<u64>().unwrap();
-        let d = std::time::Duration::from_millis(millis);
-
-        tracing::info!("failpoint {:?}: sleeping for {:?}", name, d);
-        tokio::time::sleep(d).await;
-        tracing::info!("failpoint {:?}: sleep done", name);
-    }
-}
-pub use failpoint_macro_helpers::failpoint_sleep_helper;
+pub mod yielding_loop;
 
 /// This is a shortcut to embed git sha into binaries and avoid copying the same build script to all packages
 ///
@@ -152,6 +135,21 @@ macro_rules! project_git_version {
             const __ARG: &[&::core::primitive::str; 2] = &match ::core::option_env!("GIT_VERSION") {
                 ::core::option::Option::Some(x) => ["git-env:", x],
                 ::core::option::Option::None => ["git:", __COMMIT_FROM_GIT],
+            };
+
+            $crate::__const_format::concatcp!(__ARG[0], __ARG[1])
+        };
+    };
+}
+
+/// This is a shortcut to embed build tag into binaries and avoid copying the same build script to all packages
+#[macro_export]
+macro_rules! project_build_tag {
+    ($const_identifier:ident) => {
+        const $const_identifier: &::core::primitive::str = {
+            const __ARG: &[&::core::primitive::str; 2] = &match ::core::option_env!("BUILD_TAG") {
+                ::core::option::Option::Some(x) => ["build_tag-env:", x],
+                ::core::option::Option::None => ["build_tag:", ""],
             };
 
             $crate::__const_format::concatcp!(__ARG[0], __ARG[1])

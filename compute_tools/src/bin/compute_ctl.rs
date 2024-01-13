@@ -20,9 +20,10 @@
 //! - `http-endpoint` runs a Hyper HTTP API server, which serves readiness and the
 //!   last activity requests.
 //!
-//! If the `vm-informant` binary is present at `/bin/vm-informant`, it will also be started. For VM
-//! compute nodes, `vm-informant` communicates with the VM autoscaling system. It coordinates
-//! downscaling and (eventually) will request immediate upscaling under resource pressure.
+//! If `AUTOSCALING` environment variable is set, `compute_ctl` will start the
+//! `vm-monitor` located in [`neon/libs/vm_monitor`]. For VM compute nodes,
+//! `vm-monitor` communicates with the VM autoscaling system. It coordinates
+//! downscaling and requests immediate upscaling under resource pressure.
 //!
 //! Usage example:
 //! ```sh
@@ -30,28 +31,33 @@
 //!             -C 'postgresql://cloud_admin@localhost/postgres' \
 //!             -S /var/db/postgres/specs/current.json \
 //!             -b /usr/local/bin/postgres \
-//!             -r {"bucket": "neon-dev-extensions-eu-central-1", "region": "eu-central-1"}
+//!             -r http://pg-ext-s3-gateway \
+//!             --pgbouncer-connstr 'host=localhost port=6432 dbname=pgbouncer user=cloud_admin sslmode=disable'
+//!             --pgbouncer-ini-path /etc/pgbouncer.ini \
 //! ```
 //!
 use std::collections::HashMap;
 use std::fs::File;
-use std::panic;
 use std::path::Path;
 use std::process::exit;
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::{thread, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Arg;
+use nix::sys::signal::{kill, Signal};
+use signal_hook::consts::{SIGQUIT, SIGTERM};
+use signal_hook::{consts::SIGINT, iterator::Signals};
 use tracing::{error, info};
 use url::Url;
 
 use compute_api::responses::ComputeStatus;
 
-use compute_tools::compute::{ComputeNode, ComputeState, ParsedSpec};
+use compute_tools::compute::{ComputeNode, ComputeState, ParsedSpec, PG_PID, SYNC_SAFEKEEPERS_PID};
 use compute_tools::configurator::launch_configurator;
-use compute_tools::extension_server::{get_pg_version, init_remote_storage};
+use compute_tools::extension_server::get_pg_version;
 use compute_tools::http::api::launch_http_server;
 use compute_tools::logger::*;
 use compute_tools::monitor::launch_monitor;
@@ -60,10 +66,17 @@ use compute_tools::spec::*;
 
 // this is an arbitrary build tag. Fine as a default / for testing purposes
 // in-case of not-set environment var
-const BUILD_TAG_DEFAULT: &str = "5670669815";
+const BUILD_TAG_DEFAULT: &str = "latest";
 
 fn main() -> Result<()> {
     init_tracing_and_logging(DEFAULT_LOG_LEVEL)?;
+
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGQUIT])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            handle_exit_signal(sig);
+        }
+    });
 
     let build_tag = option_env!("BUILD_TAG")
         .unwrap_or(BUILD_TAG_DEFAULT)
@@ -74,10 +87,18 @@ fn main() -> Result<()> {
     let pgbin_default = String::from("postgres");
     let pgbin = matches.get_one::<String>("pgbin").unwrap_or(&pgbin_default);
 
-    let remote_ext_config = matches.get_one::<String>("remote-ext-config");
-    let ext_remote_storage = remote_ext_config.map(|x| {
-        init_remote_storage(x).expect("cannot initialize remote extension storage from config")
-    });
+    let ext_remote_storage = matches
+        .get_one::<String>("remote-ext-config")
+        // Compatibility hack: if the control plane specified any remote-ext-config
+        // use the default value for extension storage proxy gateway.
+        // Remove this once the control plane is updated to pass the gateway URL
+        .map(|conf| {
+            if conf.starts_with("http") {
+                conf.trim_end_matches('/')
+            } else {
+                "http://pg-ext-s3-gateway"
+            }
+        });
 
     let http_port = *matches
         .get_one::<u16>("http-port")
@@ -90,6 +111,9 @@ fn main() -> Result<()> {
         .expect("Postgres connection string is required");
     let spec_json = matches.get_one::<String>("spec");
     let spec_path = matches.get_one::<String>("spec-path");
+
+    let pgbouncer_connstr = matches.get_one::<String>("pgbouncer-connstr");
+    let pgbouncer_ini_path = matches.get_one::<String>("pgbouncer-ini-path");
 
     // Extract OpenTelemetry context for the startup actions from the
     // TRACEPARENT and TRACESTATE env variables, and attach it to the current
@@ -147,6 +171,7 @@ fn main() -> Result<()> {
     match spec_json {
         // First, try to get cluster spec from the cli argument
         Some(json) => {
+            info!("got spec from cli argument {}", json);
             spec = Some(serde_json::from_str(json)?);
         }
         None => {
@@ -155,6 +180,7 @@ fn main() -> Result<()> {
                 let path = Path::new(sp);
                 let file = File::open(path)?;
                 spec = Some(serde_json::from_reader(file)?);
+                live_config_allowed = true;
             } else if let Some(id) = compute_id {
                 if let Some(cp_base) = control_plane_uri {
                     live_config_allowed = true;
@@ -182,6 +208,7 @@ fn main() -> Result<()> {
 
     if let Some(spec) = spec {
         let pspec = ParsedSpec::try_from(spec).map_err(|msg| anyhow::anyhow!(msg))?;
+        info!("new pspec.spec: {:?}", pspec.spec);
         new_state.pspec = Some(pspec);
         spec_set = true;
     } else {
@@ -195,18 +222,18 @@ fn main() -> Result<()> {
         live_config_allowed,
         state: Mutex::new(new_state),
         state_changed: Condvar::new(),
-        ext_remote_storage,
-        ext_remote_paths: OnceLock::new(),
+        ext_remote_storage: ext_remote_storage.map(|s| s.to_string()),
         ext_download_progress: RwLock::new(HashMap::new()),
-        library_index: OnceLock::new(),
         build_tag,
+        pgbouncer_connstr: pgbouncer_connstr.map(|s| s.to_string()),
+        pgbouncer_ini_path: pgbouncer_ini_path.map(|s| s.to_string()),
     };
     let compute = Arc::new(compute_node);
 
     // If this is a pooled VM, prewarm before starting HTTP server and becoming
-    // available for binding. Prewarming helps postgres start quicker later,
+    // available for binding. Prewarming helps Postgres start quicker later,
     // because QEMU will already have it's memory allocated from the host, and
-    // the necessary binaries will alreaady be cached.
+    // the necessary binaries will already be cached.
     if !spec_set {
         compute.prewarm_postgres()?;
     }
@@ -249,6 +276,11 @@ fn main() -> Result<()> {
 
     state.status = ComputeStatus::Init;
     compute.state_changed.notify_all();
+
+    info!(
+        "running compute with features: {:?}",
+        state.pspec.as_ref().unwrap().spec.features
+    );
     drop(state);
 
     // Launch remaining service threads
@@ -261,27 +293,102 @@ fn main() -> Result<()> {
     let pg = match compute.start_compute(extension_server_port) {
         Ok(pg) => Some(pg),
         Err(err) => {
-            error!("could not start the compute node: {:?}", err);
+            error!("could not start the compute node: {:#}", err);
             let mut state = compute.state.lock().unwrap();
             state.error = Some(format!("{:?}", err));
             state.status = ComputeStatus::Failed;
-            drop(state);
+            // Notify others that Postgres failed to start. In case of configuring the
+            // empty compute, it's likely that API handler is still waiting for compute
+            // state change. With this we will notify it that compute is in Failed state,
+            // so control plane will know about it earlier and record proper error instead
+            // of timeout.
+            compute.state_changed.notify_all();
+            drop(state); // unlock
             delay_exit = true;
             None
         }
     };
 
+    // Start the vm-monitor if directed to. The vm-monitor only runs on linux
+    // because it requires cgroups.
+    cfg_if::cfg_if! {
+        if #[cfg(target_os = "linux")] {
+            use std::env;
+            use tokio_util::sync::CancellationToken;
+            let vm_monitor_addr = matches
+                .get_one::<String>("vm-monitor-addr")
+                .expect("--vm-monitor-addr should always be set because it has a default arg");
+            let file_cache_connstr = matches.get_one::<String>("filecache-connstr");
+            let cgroup = matches.get_one::<String>("cgroup");
+
+            // Only make a runtime if we need to.
+            // Note: it seems like you can make a runtime in an inner scope and
+            // if you start a task in it it won't be dropped. However, make it
+            // in the outermost scope just to be safe.
+            let rt = if env::var_os("AUTOSCALING").is_some() {
+                Some(
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(4)
+                        .enable_all()
+                        .build()
+                        .expect("failed to create tokio runtime for monitor")
+                )
+            } else {
+                None
+            };
+
+            // This token is used internally by the monitor to clean up all threads
+            let token = CancellationToken::new();
+
+            let vm_monitor = &rt.as_ref().map(|rt| {
+                rt.spawn(vm_monitor::start(
+                    Box::leak(Box::new(vm_monitor::Args {
+                        cgroup: cgroup.cloned(),
+                        pgconnstr: file_cache_connstr.cloned(),
+                        addr: vm_monitor_addr.clone(),
+                    })),
+                    token.clone(),
+                ))
+            });
+        }
+    }
+
     // Wait for the child Postgres process forever. In this state Ctrl+C will
     // propagate to Postgres and it will be shut down as well.
-    if let Some(mut pg) = pg {
+    if let Some((mut pg, logs_handle)) = pg {
         // Startup is finished, exit the startup tracing span
         drop(startup_context_guard);
 
         let ecode = pg
             .wait()
             .expect("failed to start waiting on Postgres process");
+        PG_PID.store(0, Ordering::SeqCst);
+
+        // Process has exited, so we can join the logs thread.
+        let _ = logs_handle
+            .join()
+            .map_err(|e| tracing::error!("log thread panicked: {:?}", e));
+
         info!("Postgres exited with code {}, shutting down", ecode);
         exit_code = ecode.code()
+    }
+
+    // Terminate the vm_monitor so it releases the file watcher on
+    // /sys/fs/cgroup/neon-postgres.
+    // Note: the vm-monitor only runs on linux because it requires cgroups.
+    cfg_if::cfg_if! {
+        if #[cfg(target_os = "linux")] {
+            if let Some(handle) = vm_monitor {
+                // Kills all threads spawned by the monitor
+                token.cancel();
+                // Kills the actual task running the monitor
+                handle.abort();
+
+                // If handle is some, rt must have been used to produce it, and
+                // hence is also some
+                rt.unwrap().shutdown_timeout(Duration::from_secs(2));
+            }
+        }
     }
 
     // Maybe sync safekeepers again, to speed up next startup
@@ -393,6 +500,64 @@ fn cli() -> clap::Command {
                 .long("remote-ext-config")
                 .value_name("REMOTE_EXT_CONFIG"),
         )
+        // TODO(fprasx): we currently have default arguments because the cloud PR
+        // to pass them in hasn't been merged yet. We should get rid of them once
+        // the PR is merged.
+        .arg(
+            Arg::new("vm-monitor-addr")
+                .long("vm-monitor-addr")
+                .default_value("0.0.0.0:10301")
+                .value_name("VM_MONITOR_ADDR"),
+        )
+        .arg(
+            Arg::new("cgroup")
+                .long("cgroup")
+                .default_value("neon-postgres")
+                .value_name("CGROUP"),
+        )
+        .arg(
+            Arg::new("filecache-connstr")
+                .long("filecache-connstr")
+                .default_value(
+                    "host=localhost port=5432 dbname=postgres user=cloud_admin sslmode=disable",
+                )
+                .value_name("FILECACHE_CONNSTR"),
+        )
+        .arg(
+            Arg::new("pgbouncer-connstr")
+                .long("pgbouncer-connstr")
+                .default_value(
+                    "host=localhost port=6432 dbname=pgbouncer user=cloud_admin sslmode=disable",
+                )
+                .value_name("PGBOUNCER_CONNSTR"),
+        )
+        .arg(
+            Arg::new("pgbouncer-ini-path")
+                .long("pgbouncer-ini-path")
+                // Note: this doesn't match current path for pgbouncer.ini.
+                // Until we fix it, we need to pass the path explicitly
+                // or this will be effectively no-op.
+                .default_value("/etc/pgbouncer.ini")
+                .value_name("PGBOUNCER_INI_PATH"),
+        )
+}
+
+/// When compute_ctl is killed, send also termination signal to sync-safekeepers
+/// to prevent leakage. TODO: it is better to convert compute_ctl to async and
+/// wait for termination which would be easy then.
+fn handle_exit_signal(sig: i32) {
+    info!("received {sig} termination signal");
+    let ss_pid = SYNC_SAFEKEEPERS_PID.load(Ordering::SeqCst);
+    if ss_pid != 0 {
+        let ss_pid = nix::unistd::Pid::from_raw(ss_pid as i32);
+        kill(ss_pid, Signal::SIGTERM).ok();
+    }
+    let pg_pid = PG_PID.load(Ordering::SeqCst);
+    if pg_pid != 0 {
+        let pg_pid = nix::unistd::Pid::from_raw(pg_pid as i32);
+        kill(pg_pid, Signal::SIGTERM).ok();
+    }
+    exit(1);
 }
 
 #[test]

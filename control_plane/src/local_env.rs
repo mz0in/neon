@@ -5,10 +5,10 @@
 
 use anyhow::{bail, ensure, Context};
 
+use clap::ValueEnum;
 use postgres_backend::AuthType;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -33,7 +33,6 @@ pub const DEFAULT_PG_VERSION: u32 = 15;
 // to 'neon_local init --config=<path>' option. See control_plane/simple.conf for
 // an example.
 //
-#[serde_as]
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct LocalEnv {
     // Base directory for all the nodes (the pageserver, safekeepers and
@@ -59,7 +58,6 @@ pub struct LocalEnv {
     // Default tenant ID to use with the 'neon_local' command line utility, when
     // --tenant_id is not explicitly specified.
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
     pub default_tenant_id: Option<TenantId>,
 
     // used to issue tokens during e.g pg start
@@ -68,17 +66,22 @@ pub struct LocalEnv {
 
     pub broker: NeonBroker,
 
-    pub pageserver: PageServerConf,
+    /// This Vec must always contain at least one pageserver
+    pub pageservers: Vec<PageServerConf>,
 
     #[serde(default)]
     pub safekeepers: Vec<SafekeeperConf>,
+
+    // Control plane location: if None, we will not run attachment_service.  If set, this will
+    // be propagated into each pageserver's configuration.
+    #[serde(default)]
+    pub control_plane_api: Option<Url>,
 
     /// Keep human-readable aliases in memory (and persist them to config), to hide ZId hex strings from the user.
     #[serde(default)]
     // A `HashMap<String, HashMap<TenantId, TimelineId>>` would be more appropriate here,
     // but deserialization into a generic toml object as `toml::Value::try_from` fails with an error.
     // https://toml.io/en/v1.0.0 does not contain a concept of "a table inside another table".
-    #[serde_as(as = "HashMap<_, Vec<(DisplayFromStr, DisplayFromStr)>>")]
     branch_name_mappings: HashMap<String, Vec<(TenantId, TimelineId)>>,
 }
 
@@ -160,6 +163,31 @@ impl Default for SafekeeperConf {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum InitForceMode {
+    MustNotExist,
+    EmptyDirOk,
+    RemoveAllContents,
+}
+
+impl ValueEnum for InitForceMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self::MustNotExist,
+            Self::EmptyDirOk,
+            Self::RemoveAllContents,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            InitForceMode::MustNotExist => "must-not-exist",
+            InitForceMode::EmptyDirOk => "empty-dir-ok",
+            InitForceMode::RemoveAllContents => "remove-all-contents",
+        }))
+    }
+}
+
 impl SafekeeperConf {
     /// Compute is served by port on which only tenant scoped tokens allowed, if
     /// it is configured.
@@ -176,30 +204,26 @@ impl LocalEnv {
     pub fn pg_distrib_dir(&self, pg_version: u32) -> anyhow::Result<PathBuf> {
         let path = self.pg_distrib_dir.clone();
 
+        #[allow(clippy::manual_range_patterns)]
         match pg_version {
-            14 => Ok(path.join(format!("v{pg_version}"))),
-            15 => Ok(path.join(format!("v{pg_version}"))),
+            14 | 15 | 16 => Ok(path.join(format!("v{pg_version}"))),
             _ => bail!("Unsupported postgres version: {}", pg_version),
         }
     }
 
     pub fn pg_bin_dir(&self, pg_version: u32) -> anyhow::Result<PathBuf> {
-        match pg_version {
-            14 => Ok(self.pg_distrib_dir(pg_version)?.join("bin")),
-            15 => Ok(self.pg_distrib_dir(pg_version)?.join("bin")),
-            _ => bail!("Unsupported postgres version: {}", pg_version),
-        }
+        Ok(self.pg_distrib_dir(pg_version)?.join("bin"))
     }
     pub fn pg_lib_dir(&self, pg_version: u32) -> anyhow::Result<PathBuf> {
-        match pg_version {
-            14 => Ok(self.pg_distrib_dir(pg_version)?.join("lib")),
-            15 => Ok(self.pg_distrib_dir(pg_version)?.join("lib")),
-            _ => bail!("Unsupported postgres version: {}", pg_version),
-        }
+        Ok(self.pg_distrib_dir(pg_version)?.join("lib"))
     }
 
     pub fn pageserver_bin(&self) -> PathBuf {
         self.neon_distrib_dir.join("pageserver")
+    }
+
+    pub fn attachment_service_bin(&self) -> PathBuf {
+        self.neon_distrib_dir.join("attachment_service")
     }
 
     pub fn safekeeper_bin(&self) -> PathBuf {
@@ -214,13 +238,21 @@ impl LocalEnv {
         self.base_data_dir.join("endpoints")
     }
 
-    // TODO: move pageserver files into ./pageserver
-    pub fn pageserver_data_dir(&self) -> PathBuf {
-        self.base_data_dir.clone()
+    pub fn pageserver_data_dir(&self, pageserver_id: NodeId) -> PathBuf {
+        self.base_data_dir
+            .join(format!("pageserver_{pageserver_id}"))
     }
 
     pub fn safekeeper_data_dir(&self, data_dir_name: &str) -> PathBuf {
         self.base_data_dir.join("safekeepers").join(data_dir_name)
+    }
+
+    pub fn get_pageserver_conf(&self, id: NodeId) -> anyhow::Result<&PageServerConf> {
+        if let Some(conf) = self.pageservers.iter().find(|node| node.id == id) {
+            Ok(conf)
+        } else {
+            bail!("could not find pageserver {id}")
+        }
     }
 
     pub fn register_branch_mapping(
@@ -299,6 +331,10 @@ impl LocalEnv {
             env.neon_distrib_dir = env::current_exe()?.parent().unwrap().to_owned();
         }
 
+        if env.pageservers.is_empty() {
+            anyhow::bail!("Configuration must contain at least one pageserver");
+        }
+
         env.base_data_dir = base_path();
 
         Ok(env)
@@ -331,7 +367,7 @@ impl LocalEnv {
         // We read that in, in `create_config`, and fill any missing defaults. Then it's saved
         // to .neon/config. TODO: We lose any formatting and comments along the way, which is
         // a bit sad.
-        let mut conf_content = r#"# This file describes a locale deployment of the page server
+        let mut conf_content = r#"# This file describes a local deployment of the page server
 # and safekeeeper node. It is read by the 'neon_local' command-line
 # utility.
 "#
@@ -374,7 +410,7 @@ impl LocalEnv {
     //
     // Initialize a new Neon repository
     //
-    pub fn init(&mut self, pg_version: u32, force: bool) -> anyhow::Result<()> {
+    pub fn init(&mut self, pg_version: u32, force: &InitForceMode) -> anyhow::Result<()> {
         // check if config already exists
         let base_path = &self.base_data_dir;
         ensure!(
@@ -383,25 +419,34 @@ impl LocalEnv {
         );
 
         if base_path.exists() {
-            if force {
-                println!("removing all contents of '{}'", base_path.display());
-                // instead of directly calling `remove_dir_all`, we keep the original dir but removing
-                // all contents inside. This helps if the developer symbol links another directory (i.e.,
-                // S3 local SSD) to the `.neon` base directory.
-                for entry in std::fs::read_dir(base_path)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        fs::remove_dir_all(&path)?;
-                    } else {
-                        fs::remove_file(&path)?;
+            match force {
+                InitForceMode::MustNotExist => {
+                    bail!(
+                        "directory '{}' already exists. Perhaps already initialized?",
+                        base_path.display()
+                    );
+                }
+                InitForceMode::EmptyDirOk => {
+                    if let Some(res) = std::fs::read_dir(base_path)?.next() {
+                        res.context("check if directory is empty")?;
+                        anyhow::bail!("directory not empty: {base_path:?}");
                     }
                 }
-            } else {
-                bail!(
-                    "directory '{}' already exists. Perhaps already initialized? (Hint: use --force to remove all contents)",
-                    base_path.display()
-                );
+                InitForceMode::RemoveAllContents => {
+                    println!("removing all contents of '{}'", base_path.display());
+                    // instead of directly calling `remove_dir_all`, we keep the original dir but removing
+                    // all contents inside. This helps if the developer symbol links another directory (i.e.,
+                    // S3 local SSD) to the `.neon` base directory.
+                    for entry in std::fs::read_dir(base_path)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            fs::remove_dir_all(&path)?;
+                        } else {
+                            fs::remove_file(&path)?;
+                        }
+                    }
+                }
             }
         }
 
@@ -461,9 +506,9 @@ impl LocalEnv {
     }
 
     fn auth_keys_needed(&self) -> bool {
-        self.pageserver.pg_auth_type == AuthType::NeonJWT
-            || self.pageserver.http_auth_type == AuthType::NeonJWT
-            || self.safekeepers.iter().any(|sk| sk.auth_enabled)
+        self.pageservers.iter().any(|ps| {
+            ps.pg_auth_type == AuthType::NeonJWT || ps.http_auth_type == AuthType::NeonJWT
+        }) || self.safekeepers.iter().any(|sk| sk.auth_enabled)
     }
 }
 

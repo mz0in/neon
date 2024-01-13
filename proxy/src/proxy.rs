@@ -1,90 +1,63 @@
 #[cfg(test)]
 mod tests;
 
+pub mod connect_compute;
+pub mod retry;
+
 use crate::{
-    auth::{self, backend::AuthSuccess},
+    auth,
     cancellation::{self, CancelMap},
-    compute::{self, PostgresConnection},
-    config::{ProxyConfig, TlsConfig},
-    console::{self, errors::WakeComputeError, messages::MetricsAuxInfo, Api},
+    compute,
+    config::{AuthenticationConfig, ProxyConfig, TlsConfig},
+    console::messages::MetricsAuxInfo,
+    context::RequestMonitoring,
+    metrics::{
+        NUM_BYTES_PROXIED_COUNTER, NUM_BYTES_PROXIED_PER_CLIENT_COUNTER,
+        NUM_CLIENT_CONNECTION_GAUGE, NUM_CONNECTION_REQUESTS_GAUGE,
+    },
+    protocol2::WithClientIp,
+    rate_limiter::EndpointRateLimiter,
     stream::{PqStream, Stream},
+    usage_metrics::{Ids, USAGE_METRICS},
 };
 use anyhow::{bail, Context};
-use async_trait::async_trait;
 use futures::TryFutureExt;
-use metrics::{
-    exponential_buckets, register_histogram, register_int_counter_vec, Histogram, IntCounterVec,
-};
-use once_cell::sync::Lazy;
+use itertools::Itertools;
+use once_cell::sync::OnceCell;
 use pq_proto::{BeMessage as Be, FeStartupPacket, StartupMessageParams};
-use std::{error::Error, io, ops::ControlFlow, sync::Arc};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    time,
-};
+use regex::Regex;
+use smol_str::SmolStr;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{error, info, info_span, Instrument};
 use utils::measured_stream::MeasuredStream;
 
-/// Number of times we should retry the `/proxy_wake_compute` http request.
-/// Retry duration is BASE_RETRY_WAIT_DURATION * 1.5^n
-pub const NUM_RETRIES_CONNECT: u32 = 10;
-const CONNECT_TIMEOUT: time::Duration = time::Duration::from_secs(2);
-const BASE_RETRY_WAIT_DURATION: time::Duration = time::Duration::from_millis(100);
+use self::connect_compute::{connect_to_compute, TcpMechanism};
 
 const ERR_INSECURE_CONNECTION: &str = "connection is insecure (try using `sslmode=require`)";
 const ERR_PROTO_VIOLATION: &str = "protocol violation";
 
-static NUM_CONNECTIONS_ACCEPTED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "proxy_accepted_connections_total",
-        "Number of TCP client connections accepted.",
-        &["protocol"],
+pub async fn run_until_cancelled<F: std::future::Future>(
+    f: F,
+    cancellation_token: &CancellationToken,
+) -> Option<F::Output> {
+    match futures::future::select(
+        std::pin::pin!(f),
+        std::pin::pin!(cancellation_token.cancelled()),
     )
-    .unwrap()
-});
-
-static NUM_CONNECTIONS_CLOSED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "proxy_closed_connections_total",
-        "Number of TCP client connections closed.",
-        &["protocol"],
-    )
-    .unwrap()
-});
-
-static COMPUTE_CONNECTION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
-    register_histogram!(
-        "proxy_compute_connection_latency_seconds",
-        "Time it took for proxy to establish a connection to the compute endpoint",
-        // largest bucket = 2^16 * 0.5ms = 32s
-        exponential_buckets(0.0005, 2.0, 16).unwrap(),
-    )
-    .unwrap()
-});
-
-static NUM_CONNECTION_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "proxy_connection_failures_total",
-        "Number of connection failures (per kind).",
-        &["kind"],
-    )
-    .unwrap()
-});
-
-static NUM_BYTES_PROXIED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "proxy_io_bytes_per_client",
-        "Number of bytes sent/received between client and backend.",
-        crate::console::messages::MetricsAuxInfo::TRAFFIC_LABELS,
-    )
-    .unwrap()
-});
+    .await
+    {
+        futures::future::Either::Left((f, _)) => Some(f),
+        futures::future::Either::Right(((), _)) => None,
+    }
+}
 
 pub async fn task_main(
     config: &'static ProxyConfig,
     listener: tokio::net::TcpListener,
     cancellation_token: CancellationToken,
+    endpoint_rate_limiter: Arc<EndpointRateLimiter>,
 ) -> anyhow::Result<()> {
     scopeguard::defer! {
         info!("proxy has shut down");
@@ -94,47 +67,66 @@ pub async fn task_main(
     // will be inherited by all accepted client sockets.
     socket2::SockRef::from(&listener).set_keepalive(true)?;
 
-    let mut connections = tokio::task::JoinSet::new();
+    let connections = tokio_util::task::task_tracker::TaskTracker::new();
     let cancel_map = Arc::new(CancelMap::default());
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (socket, peer_addr) = accept_result?;
+    while let Some(accept_result) =
+        run_until_cancelled(listener.accept(), &cancellation_token).await
+    {
+        let (socket, peer_addr) = accept_result?;
 
-                let session_id = uuid::Uuid::new_v4();
-                let cancel_map = Arc::clone(&cancel_map);
-                connections.spawn(
-                    async move {
-                        info!("accepted postgres client connection");
+        let session_id = uuid::Uuid::new_v4();
+        let cancel_map = Arc::clone(&cancel_map);
+        let endpoint_rate_limiter = endpoint_rate_limiter.clone();
 
-                        socket
-                            .set_nodelay(true)
-                            .context("failed to set socket option")?;
+        connections.spawn(
+            async move {
+                info!("accepted postgres client connection");
 
-                        handle_client(config, &cancel_map, session_id, socket, ClientMode::Tcp).await
-                    }
-                    .instrument(info_span!("handle_client", ?session_id, %peer_addr))
-                    .unwrap_or_else(move |e| {
-                        // Acknowledge that the task has finished with an error.
-                        error!(?session_id, "per-client task finished with an error: {e:#}");
-                    }),
-                );
+                let mut socket = WithClientIp::new(socket);
+                let mut peer_addr = peer_addr.ip();
+                if let Some(addr) = socket.wait_for_addr().await? {
+                    peer_addr = addr.ip();
+                    tracing::Span::current().record("peer_addr", &tracing::field::display(addr));
+                } else if config.require_client_ip {
+                    bail!("missing required client IP");
+                }
+
+                let mut ctx = RequestMonitoring::new(session_id, peer_addr, "tcp", &config.region);
+
+                socket
+                    .inner
+                    .set_nodelay(true)
+                    .context("failed to set socket option")?;
+
+                handle_client(
+                    config,
+                    &mut ctx,
+                    &cancel_map,
+                    socket,
+                    ClientMode::Tcp,
+                    endpoint_rate_limiter,
+                )
+                .await
             }
-            _ = cancellation_token.cancelled() => {
-                drop(listener);
-                break;
-            }
-        }
+            .instrument(info_span!(
+                "handle_client",
+                ?session_id,
+                peer_addr = tracing::field::Empty
+            ))
+            .unwrap_or_else(move |e| {
+                // Acknowledge that the task has finished with an error.
+                error!(?session_id, "per-client task finished with an error: {e:#}");
+            }),
+        );
     }
+
+    connections.close();
+    drop(listener);
+
     // Drain connections
-    while let Some(res) = connections.join_next().await {
-        if let Err(e) = res {
-            if !e.is_panic() && !e.is_cancelled() {
-                warn!("unexpected error from joined connection task: {e:?}");
-            }
-        }
-    }
+    connections.wait().await;
+
     Ok(())
 }
 
@@ -145,13 +137,6 @@ pub enum ClientMode {
 
 /// Abstracts the logic of handling TCP vs WS clients
 impl ClientMode {
-    fn protocol_label(&self) -> &'static str {
-        match self {
-            ClientMode::Tcp => "tcp",
-            ClientMode::Websockets { .. } => "ws",
-        }
-    }
-
     fn allow_cleartext(&self) -> bool {
         match self {
             ClientMode::Tcp => false,
@@ -184,57 +169,67 @@ impl ClientMode {
 
 pub async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
     config: &'static ProxyConfig,
+    ctx: &mut RequestMonitoring,
     cancel_map: &CancelMap,
-    session_id: uuid::Uuid,
     stream: S,
     mode: ClientMode,
+    endpoint_rate_limiter: Arc<EndpointRateLimiter>,
 ) -> anyhow::Result<()> {
     info!(
-        protocol = mode.protocol_label(),
+        protocol = ctx.protocol,
         "handling interactive connection from client"
     );
 
-    // The `closed` counter will increase when this future is destroyed.
-    NUM_CONNECTIONS_ACCEPTED_COUNTER
-        .with_label_values(&[mode.protocol_label()])
-        .inc();
-    scopeguard::defer! {
-        NUM_CONNECTIONS_CLOSED_COUNTER.with_label_values(&[mode.protocol_label()]).inc();
-    }
+    let proto = ctx.protocol;
+    let _client_gauge = NUM_CLIENT_CONNECTION_GAUGE
+        .with_label_values(&[proto])
+        .guard();
+    let _request_gauge = NUM_CONNECTION_REQUESTS_GAUGE
+        .with_label_values(&[proto])
+        .guard();
 
     let tls = config.tls_config.as_ref();
 
+    let pause = ctx.latency_timer.pause();
     let do_handshake = handshake(stream, mode.handshake_tls(tls), cancel_map);
     let (mut stream, params) = match do_handshake.await? {
         Some(x) => x,
         None => return Ok(()), // it's a cancellation request
     };
+    drop(pause);
 
     // Extract credentials which we're going to use for auth.
-    let creds = {
+    let user_info = {
         let hostname = mode.hostname(stream.get_ref());
-        let common_names = tls.and_then(|tls| tls.common_names.clone());
+
+        let common_names = tls.map(|tls| &tls.common_names);
         let result = config
             .auth_backend
             .as_ref()
-            .map(|_| auth::ClientCredentials::parse(&params, hostname, common_names))
+            .map(|_| {
+                auth::ComputeUserInfoMaybeEndpoint::parse(ctx, &params, hostname, common_names)
+            })
             .transpose();
 
         match result {
-            Ok(creds) => creds,
+            Ok(user_info) => user_info,
             Err(e) => stream.throw_error(e).await?,
         }
     };
 
+    ctx.set_endpoint_id(user_info.get_endpoint());
+
     let client = Client::new(
         stream,
-        creds,
+        user_info,
         &params,
-        session_id,
         mode.allow_self_signed_compute(config),
+        endpoint_rate_limiter,
     );
     cancel_map
-        .with_session(|session| client.connect_to_db(session, mode.allow_cleartext()))
+        .with_session(|session| {
+            client.connect_to_db(ctx, session, mode, &config.authentication_config)
+        })
         .await
 }
 
@@ -279,7 +274,17 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
                         if !read_buf.is_empty() {
                             bail!("data is sent before server replied with EncryptionResponse");
                         }
-                        stream = PqStream::new(raw.upgrade(tls.to_server_config()).await?);
+                        let tls_stream = raw.upgrade(tls.to_server_config()).await?;
+
+                        let (_, tls_server_end_point) = tls
+                            .cert_resolver
+                            .resolve(tls_stream.get_ref().1.server_name())
+                            .context("missing certificate")?;
+
+                        stream = PqStream::new(Stream::Tls {
+                            tls: Box::new(tls_stream),
+                            tls_server_end_point,
+                        });
                     }
                 }
                 _ => bail!(ERR_PROTO_VIOLATION),
@@ -313,261 +318,16 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// If we couldn't connect, a cached connection info might be to blame
-/// (e.g. the compute node's address might've changed at the wrong time).
-/// Invalidate the cache entry (if any) to prevent subsequent errors.
-#[tracing::instrument(name = "invalidate_cache", skip_all)]
-pub fn invalidate_cache(node_info: console::CachedNodeInfo) -> compute::ConnCfg {
-    let is_cached = node_info.cached();
-    if is_cached {
-        warn!("invalidating stalled compute node info cache entry");
-    }
-    let label = match is_cached {
-        true => "compute_cached",
-        false => "compute_uncached",
-    };
-    NUM_CONNECTION_FAILURES.with_label_values(&[label]).inc();
-
-    node_info.invalidate().config
-}
-
-/// Try to connect to the compute node once.
-#[tracing::instrument(name = "connect_once", skip_all)]
-async fn connect_to_compute_once(
-    node_info: &console::CachedNodeInfo,
-    timeout: time::Duration,
-) -> Result<PostgresConnection, compute::ConnectionError> {
-    let allow_self_signed_compute = node_info.allow_self_signed_compute;
-
-    node_info
-        .config
-        .connect(allow_self_signed_compute, timeout)
-        .await
-}
-
-#[async_trait]
-pub trait ConnectMechanism {
-    type Connection;
-    type ConnectError;
-    type Error: From<Self::ConnectError>;
-    async fn connect_once(
-        &self,
-        node_info: &console::CachedNodeInfo,
-        timeout: time::Duration,
-    ) -> Result<Self::Connection, Self::ConnectError>;
-
-    fn update_connect_config(&self, conf: &mut compute::ConnCfg);
-}
-
-pub struct TcpMechanism<'a> {
-    /// KV-dictionary with PostgreSQL connection params.
-    pub params: &'a StartupMessageParams,
-}
-
-#[async_trait]
-impl ConnectMechanism for TcpMechanism<'_> {
-    type Connection = PostgresConnection;
-    type ConnectError = compute::ConnectionError;
-    type Error = compute::ConnectionError;
-
-    async fn connect_once(
-        &self,
-        node_info: &console::CachedNodeInfo,
-        timeout: time::Duration,
-    ) -> Result<PostgresConnection, Self::Error> {
-        connect_to_compute_once(node_info, timeout).await
-    }
-
-    fn update_connect_config(&self, config: &mut compute::ConnCfg) {
-        config.set_startup_params(self.params);
-    }
-}
-
-/// Try to connect to the compute node, retrying if necessary.
-/// This function might update `node_info`, so we take it by `&mut`.
-#[tracing::instrument(skip_all)]
-pub async fn connect_to_compute<M: ConnectMechanism>(
-    mechanism: &M,
-    mut node_info: console::CachedNodeInfo,
-    extra: &console::ConsoleReqExtra<'_>,
-    creds: &auth::BackendType<'_, auth::ClientCredentials<'_>>,
-) -> Result<M::Connection, M::Error>
-where
-    M::ConnectError: ShouldRetry + std::fmt::Debug,
-    M::Error: From<WakeComputeError>,
-{
-    let _timer = COMPUTE_CONNECTION_LATENCY.start_timer();
-
-    mechanism.update_connect_config(&mut node_info.config);
-
-    // try once
-    let (config, err) = match mechanism.connect_once(&node_info, CONNECT_TIMEOUT).await {
-        Ok(res) => return Ok(res),
-        Err(e) => {
-            error!(error = ?e, "could not connect to compute node");
-            (invalidate_cache(node_info), e)
-        }
-    };
-
-    let mut num_retries = 1;
-
-    // if we failed to connect, it's likely that the compute node was suspended, wake a new compute node
-    info!("compute node's state has likely changed; requesting a wake-up");
-    let node_info = loop {
-        let wake_res = match creds {
-            auth::BackendType::Console(api, creds) => api.wake_compute(extra, creds).await,
-            auth::BackendType::Postgres(api, creds) => api.wake_compute(extra, creds).await,
-            // nothing to do?
-            auth::BackendType::Link(_) => return Err(err.into()),
-            // test backend
-            auth::BackendType::Test(x) => x.wake_compute(),
-        };
-
-        match handle_try_wake(wake_res, num_retries) {
-            Err(e) => {
-                error!(error = ?e, num_retries, retriable = false, "couldn't wake compute node");
-                return Err(e.into());
-            }
-            // failed to wake up but we can continue to retry
-            Ok(ControlFlow::Continue(e)) => {
-                warn!(error = ?e, num_retries, retriable = true, "couldn't wake compute node");
-            }
-            // successfully woke up a compute node and can break the wakeup loop
-            Ok(ControlFlow::Break(mut node_info)) => {
-                node_info.config.reuse_password(&config);
-                mechanism.update_connect_config(&mut node_info.config);
-                break node_info;
-            }
-        }
-
-        let wait_duration = retry_after(num_retries);
-        num_retries += 1;
-
-        time::sleep(wait_duration).await;
-    };
-
-    // now that we have a new node, try connect to it repeatedly.
-    // this can error for a few reasons, for instance:
-    // * DNS connection settings haven't quite propagated yet
-    info!("wake_compute success. attempting to connect");
-    loop {
-        match mechanism.connect_once(&node_info, CONNECT_TIMEOUT).await {
-            Ok(res) => return Ok(res),
-            Err(e) => {
-                let retriable = e.should_retry(num_retries);
-                if !retriable {
-                    error!(error = ?e, num_retries, retriable, "couldn't connect to compute node");
-                    return Err(e.into());
-                }
-                warn!(error = ?e, num_retries, retriable, "couldn't connect to compute node");
-            }
-        }
-
-        let wait_duration = retry_after(num_retries);
-        num_retries += 1;
-
-        time::sleep(wait_duration).await;
-    }
-}
-
-/// Attempts to wake up the compute node.
-/// * Returns Ok(Continue(e)) if there was an error waking but retries are acceptable
-/// * Returns Ok(Break(node)) if the wakeup succeeded
-/// * Returns Err(e) if there was an error
-pub fn handle_try_wake(
-    result: Result<console::CachedNodeInfo, WakeComputeError>,
-    num_retries: u32,
-) -> Result<ControlFlow<console::CachedNodeInfo, WakeComputeError>, WakeComputeError> {
-    match result {
-        Err(err) => match &err {
-            WakeComputeError::ApiError(api) if api.should_retry(num_retries) => {
-                Ok(ControlFlow::Continue(err))
-            }
-            _ => Err(err),
-        },
-        // Ready to try again.
-        Ok(new) => Ok(ControlFlow::Break(new)),
-    }
-}
-
-pub trait ShouldRetry {
-    fn could_retry(&self) -> bool;
-    fn should_retry(&self, num_retries: u32) -> bool {
-        match self {
-            _ if num_retries >= NUM_RETRIES_CONNECT => false,
-            err => err.could_retry(),
-        }
-    }
-}
-
-impl ShouldRetry for io::Error {
-    fn could_retry(&self) -> bool {
-        use std::io::ErrorKind;
-        matches!(
-            self.kind(),
-            ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable | ErrorKind::TimedOut
-        )
-    }
-}
-
-impl ShouldRetry for tokio_postgres::error::DbError {
-    fn could_retry(&self) -> bool {
-        use tokio_postgres::error::SqlState;
-        matches!(
-            self.code(),
-            &SqlState::CONNECTION_FAILURE
-                | &SqlState::CONNECTION_EXCEPTION
-                | &SqlState::CONNECTION_DOES_NOT_EXIST
-                | &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-        )
-    }
-}
-
-impl ShouldRetry for tokio_postgres::Error {
-    fn could_retry(&self) -> bool {
-        if let Some(io_err) = self.source().and_then(|x| x.downcast_ref()) {
-            io::Error::could_retry(io_err)
-        } else if let Some(db_err) = self.source().and_then(|x| x.downcast_ref()) {
-            tokio_postgres::error::DbError::could_retry(db_err)
-        } else {
-            false
-        }
-    }
-}
-
-impl ShouldRetry for compute::ConnectionError {
-    fn could_retry(&self) -> bool {
-        match self {
-            compute::ConnectionError::Postgres(err) => err.could_retry(),
-            compute::ConnectionError::CouldNotConnect(err) => err.could_retry(),
-            _ => false,
-        }
-    }
-}
-
-fn retry_after(num_retries: u32) -> time::Duration {
-    // 1.5 seems to be an ok growth factor heuristic
-    BASE_RETRY_WAIT_DURATION.mul_f64(1.5_f64.powi(num_retries as i32))
-}
-
 /// Finish client connection initialization: confirm auth success, send params, etc.
 #[tracing::instrument(skip_all)]
 async fn prepare_client_connection(
     node: &compute::PostgresConnection,
-    reported_auth_ok: bool,
     session: cancellation::Session<'_>,
     stream: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
 ) -> anyhow::Result<()> {
     // Register compute's query cancellation token and produce a new, unique one.
     // The new token (cancel_key_data) will be sent to the client.
     let cancel_key_data = session.enable_query_cancellation(node.cancel_closure.clone());
-
-    // Report authentication success if we haven't done this already.
-    // Note that we do this only (for the most part) after we've connected
-    // to a compute (see above) which performs its own authentication.
-    if !reported_auth_ok {
-        stream.write_message_noflush(&Be::AuthenticationOk)?;
-    }
 
     // Forward all postgres connection params to the client.
     // Right now the implementation is very hacky and inefficent (ideally,
@@ -591,27 +351,40 @@ async fn prepare_client_connection(
 /// Forward bytes in both directions (client <-> compute).
 #[tracing::instrument(skip_all)]
 pub async fn proxy_pass(
+    ctx: &mut RequestMonitoring,
     client: impl AsyncRead + AsyncWrite + Unpin,
     compute: impl AsyncRead + AsyncWrite + Unpin,
-    aux: &MetricsAuxInfo,
+    aux: MetricsAuxInfo,
 ) -> anyhow::Result<()> {
-    let m_sent = NUM_BYTES_PROXIED_COUNTER.with_label_values(&aux.traffic_labels("tx"));
+    ctx.log();
+
+    let usage = USAGE_METRICS.register(Ids {
+        endpoint_id: aux.endpoint_id.clone(),
+        branch_id: aux.branch_id.clone(),
+    });
+
+    let m_sent = NUM_BYTES_PROXIED_COUNTER.with_label_values(&["tx"]);
+    let m_sent2 = NUM_BYTES_PROXIED_PER_CLIENT_COUNTER.with_label_values(&aux.traffic_labels("tx"));
     let mut client = MeasuredStream::new(
         client,
         |_| {},
         |cnt| {
             // Number of bytes we sent to the client (outbound).
             m_sent.inc_by(cnt as u64);
+            m_sent2.inc_by(cnt as u64);
+            usage.record_egress(cnt as u64);
         },
     );
 
-    let m_recv = NUM_BYTES_PROXIED_COUNTER.with_label_values(&aux.traffic_labels("rx"));
+    let m_recv = NUM_BYTES_PROXIED_COUNTER.with_label_values(&["rx"]);
+    let m_recv2 = NUM_BYTES_PROXIED_PER_CLIENT_COUNTER.with_label_values(&aux.traffic_labels("rx"));
     let mut compute = MeasuredStream::new(
         compute,
         |_| {},
         |cnt| {
             // Number of bytes the client sent to the compute node (inbound).
             m_recv.inc_by(cnt as u64);
+            m_recv2.inc_by(cnt as u64);
         },
     );
 
@@ -625,32 +398,32 @@ pub async fn proxy_pass(
 /// Thin connection context.
 struct Client<'a, S> {
     /// The underlying libpq protocol stream.
-    stream: PqStream<S>,
+    stream: PqStream<Stream<S>>,
     /// Client credentials that we care about.
-    creds: auth::BackendType<'a, auth::ClientCredentials<'a>>,
+    user_info: auth::BackendType<'a, auth::ComputeUserInfoMaybeEndpoint>,
     /// KV-dictionary with PostgreSQL connection params.
     params: &'a StartupMessageParams,
-    /// Unique connection ID.
-    session_id: uuid::Uuid,
     /// Allow self-signed certificates (for testing).
     allow_self_signed_compute: bool,
+    /// Rate limiter for endpoints
+    endpoint_rate_limiter: Arc<EndpointRateLimiter>,
 }
 
 impl<'a, S> Client<'a, S> {
     /// Construct a new connection context.
     fn new(
-        stream: PqStream<S>,
-        creds: auth::BackendType<'a, auth::ClientCredentials<'a>>,
+        stream: PqStream<Stream<S>>,
+        user_info: auth::BackendType<'a, auth::ComputeUserInfoMaybeEndpoint>,
         params: &'a StartupMessageParams,
-        session_id: uuid::Uuid,
         allow_self_signed_compute: bool,
+        endpoint_rate_limiter: Arc<EndpointRateLimiter>,
     ) -> Self {
         Self {
             stream,
-            creds,
+            user_info,
             params,
-            session_id,
             allow_self_signed_compute,
+            endpoint_rate_limiter,
         }
     }
 }
@@ -659,52 +432,112 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<'_, S> {
     /// Let the client authenticate and connect to the designated compute node.
     // Instrumentation logs endpoint name everywhere. Doesn't work for link
     // auth; strictly speaking we don't know endpoint name in its case.
-    #[tracing::instrument(name = "", fields(ep = self.creds.get_endpoint().unwrap_or("".to_owned())), skip_all)]
+    #[tracing::instrument(name = "", fields(ep = %self.user_info.get_endpoint().unwrap_or_default()), skip_all)]
     async fn connect_to_db(
         self,
+        ctx: &mut RequestMonitoring,
         session: cancellation::Session<'_>,
-        allow_cleartext: bool,
+        mode: ClientMode,
+        config: &'static AuthenticationConfig,
     ) -> anyhow::Result<()> {
         let Self {
             mut stream,
-            mut creds,
+            user_info,
             params,
-            session_id,
             allow_self_signed_compute,
+            endpoint_rate_limiter,
         } = self;
 
-        let extra = console::ConsoleReqExtra {
-            session_id, // aka this connection's id
-            application_name: params.get("application_name"),
-        };
+        // check rate limit
+        if let Some(ep) = user_info.get_endpoint() {
+            if !endpoint_rate_limiter.check(ep) {
+                return stream
+                    .throw_error(auth::AuthError::too_many_connections())
+                    .await;
+            }
+        }
 
-        let auth_result = match creds
-            .authenticate(&extra, &mut stream, allow_cleartext)
+        let user = user_info.get_user().to_owned();
+        let auth_result = match user_info
+            .authenticate(ctx, &mut stream, mode.allow_cleartext(), config)
             .await
         {
             Ok(auth_result) => auth_result,
-            Err(e) => return stream.throw_error(e).await,
+            Err(e) => {
+                let db = params.get("database");
+                let app = params.get("application_name");
+                let params_span = tracing::info_span!("", ?user, ?db, ?app);
+
+                return stream.throw_error(e).instrument(params_span).await;
+            }
         };
 
-        let AuthSuccess {
-            reported_auth_ok,
-            value: mut node_info,
-        } = auth_result;
+        let (mut node_info, user_info) = auth_result;
 
         node_info.allow_self_signed_compute = allow_self_signed_compute;
 
         let aux = node_info.aux.clone();
-        let mut node = connect_to_compute(&TcpMechanism { params }, node_info, &extra, &creds)
+        let mut node = connect_to_compute(ctx, &TcpMechanism { params }, node_info, &user_info)
             .or_else(|e| stream.throw_error(e))
             .await?;
 
-        prepare_client_connection(&node, reported_auth_ok, session, &mut stream).await?;
+        prepare_client_connection(&node, session, &mut stream).await?;
         // Before proxy passing, forward to compute whatever data is left in the
         // PqStream input buffer. Normally there is none, but our serverless npm
         // driver in pipeline mode sends startup, password and first query
         // immediately after opening the connection.
         let (stream, read_buf) = stream.into_inner();
         node.stream.write_all(&read_buf).await?;
-        proxy_pass(stream, node.stream, &aux).await
+        proxy_pass(ctx, stream, node.stream, aux).await
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NeonOptions(Vec<(SmolStr, SmolStr)>);
+
+impl NeonOptions {
+    pub fn parse_params(params: &StartupMessageParams) -> Self {
+        params
+            .options_raw()
+            .map(Self::parse_from_iter)
+            .unwrap_or_default()
+    }
+    pub fn parse_options_raw(options: &str) -> Self {
+        Self::parse_from_iter(StartupMessageParams::parse_options_raw(options))
+    }
+
+    fn parse_from_iter<'a>(options: impl Iterator<Item = &'a str>) -> Self {
+        let mut options = options
+            .filter_map(neon_option)
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect_vec();
+        options.sort();
+        Self(options)
+    }
+
+    pub fn get_cache_key(&self, prefix: &str) -> SmolStr {
+        // prefix + format!(" {k}:{v}")
+        // kinda jank because SmolStr is immutable
+        std::iter::once(prefix)
+            .chain(self.0.iter().flat_map(|(k, v)| [" ", &**k, ":", &**v]))
+            .collect()
+    }
+
+    /// <https://swagger.io/docs/specification/serialization/> DeepObject format
+    /// `paramName[prop1]=value1&paramName[prop2]=value2&...`
+    pub fn to_deep_object(&self) -> Vec<(String, SmolStr)> {
+        self.0
+            .iter()
+            .map(|(k, v)| (format!("options[{}]", k), v.clone()))
+            .collect()
+    }
+}
+
+pub fn neon_option(bytes: &str) -> Option<(&str, &str)> {
+    static RE: OnceCell<Regex> = OnceCell::new();
+    let re = RE.get_or_init(|| Regex::new(r"^neon_(\w+):(.+)").unwrap());
+
+    let cap = re.captures(bytes)?;
+    let (_, [k, v]) = cap.extract();
+    Some((k, v))
 }

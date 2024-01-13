@@ -1,13 +1,17 @@
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 mod auth;
 pub mod basebackup;
 pub mod config;
 pub mod consumption_metrics;
 pub mod context;
+pub mod control_plane_client;
+pub mod deletion_queue;
 pub mod disk_usage_eviction_task;
 pub mod http;
 pub mod import_datadir;
-pub mod keyspace;
-pub(crate) mod metrics;
+pub use pageserver_api::keyspace;
+pub mod metrics;
 pub mod page_cache;
 pub mod page_service;
 pub mod pgdatadir_mapping;
@@ -21,9 +25,9 @@ pub mod walingest;
 pub mod walrecord;
 pub mod walredo;
 
-use std::path::Path;
-
 use crate::task_mgr::TaskKind;
+use camino::Utf8Path;
+use deletion_queue::DeletionQueue;
 use tracing::info;
 
 /// Current storage format version
@@ -45,22 +49,14 @@ static ZERO_PAGE: bytes::Bytes = bytes::Bytes::from_static(&[0u8; 8192]);
 
 pub use crate::metrics::preinitialize_metrics;
 
-#[tracing::instrument]
-pub async fn shutdown_pageserver(exit_code: i32) {
+#[tracing::instrument(skip_all, fields(%exit_code))]
+pub async fn shutdown_pageserver(deletion_queue: Option<DeletionQueue>, exit_code: i32) {
     use std::time::Duration;
     // Shut down the libpq endpoint task. This prevents new connections from
     // being accepted.
     timed(
         task_mgr::shutdown_tasks(Some(TaskKind::LibpqEndpointListener), None, None),
         "shutdown LibpqEndpointListener",
-        Duration::from_secs(1),
-    )
-    .await;
-
-    // Shut down any page service tasks.
-    timed(
-        task_mgr::shutdown_tasks(Some(TaskKind::PageRequestHandler), None, None),
-        "shutdown PageRequestHandlers",
         Duration::from_secs(1),
     )
     .await;
@@ -73,6 +69,20 @@ pub async fn shutdown_pageserver(exit_code: i32) {
         Duration::from_secs(5),
     )
     .await;
+
+    // Shut down any page service tasks: any in-progress work for particular timelines or tenants
+    // should already have been canclled via mgr::shutdown_all_tenants
+    timed(
+        task_mgr::shutdown_tasks(Some(TaskKind::PageRequestHandler), None, None),
+        "shutdown PageRequestHandlers",
+        Duration::from_secs(1),
+    )
+    .await;
+
+    // Best effort to persist any outstanding deletions, to avoid leaking objects
+    if let Some(mut deletion_queue) = deletion_queue {
+        deletion_queue.shutdown(Duration::from_secs(5)).await;
+    }
 
     // Shut down the HTTP endpoint last, so that you can still check the server's
     // status while it's shutting down.
@@ -95,28 +105,6 @@ pub async fn shutdown_pageserver(exit_code: i32) {
     std::process::exit(exit_code);
 }
 
-const DEFAULT_BASE_BACKOFF_SECONDS: f64 = 0.1;
-const DEFAULT_MAX_BACKOFF_SECONDS: f64 = 3.0;
-
-async fn exponential_backoff(n: u32, base_increment: f64, max_seconds: f64) {
-    let backoff_duration_seconds =
-        exponential_backoff_duration_seconds(n, base_increment, max_seconds);
-    if backoff_duration_seconds > 0.0 {
-        info!(
-            "Backoff: waiting {backoff_duration_seconds} seconds before processing with the task",
-        );
-        tokio::time::sleep(std::time::Duration::from_secs_f64(backoff_duration_seconds)).await;
-    }
-}
-
-pub fn exponential_backoff_duration_seconds(n: u32, base_increment: f64, max_seconds: f64) -> f64 {
-    if n == 0 {
-        0.0
-    } else {
-        (1.0 + base_increment).powf(f64::from(n)).min(max_seconds)
-    }
-}
-
 /// The name of the metadata file pageserver creates per timeline.
 /// Full path: `tenants/<tenant_id>/timelines/<timeline_id>/metadata`.
 pub const METADATA_FILE_NAME: &str = "metadata";
@@ -124,6 +112,14 @@ pub const METADATA_FILE_NAME: &str = "metadata";
 /// Per-tenant configuration file.
 /// Full path: `tenants/<tenant_id>/config`.
 pub const TENANT_CONFIG_NAME: &str = "config";
+
+/// Per-tenant configuration file.
+/// Full path: `tenants/<tenant_id>/config`.
+pub const TENANT_LOCATION_CONFIG_NAME: &str = "config-v1";
+
+/// Per-tenant copy of their remote heatmap, downloaded into the local
+/// tenant path while in secondary mode.
+pub const TENANT_HEATMAP_BASENAME: &str = "heatmap-v1.json";
 
 /// A suffix used for various temporary files. Any temporary files found in the
 /// data directory at pageserver startup can be automatically removed.
@@ -144,25 +140,29 @@ pub const TIMELINE_DELETE_MARK_SUFFIX: &str = "___delete";
 /// Full path: `tenants/<tenant_id>/___ignored_tenant`.
 pub const IGNORED_TENANT_FILE_NAME: &str = "___ignored_tenant";
 
-pub fn is_temporary(path: &Path) -> bool {
+pub fn is_temporary(path: &Utf8Path) -> bool {
     match path.file_name() {
-        Some(name) => name.to_string_lossy().ends_with(TEMP_FILE_SUFFIX),
+        Some(name) => name.ends_with(TEMP_FILE_SUFFIX),
         None => false,
     }
 }
 
-fn ends_with_suffix(path: &Path, suffix: &str) -> bool {
+fn ends_with_suffix(path: &Utf8Path, suffix: &str) -> bool {
     match path.file_name() {
-        Some(name) => name.to_string_lossy().ends_with(suffix),
+        Some(name) => name.ends_with(suffix),
         None => false,
     }
 }
 
-pub fn is_uninit_mark(path: &Path) -> bool {
+// FIXME: DO NOT ADD new query methods like this, which will have a next step of parsing timelineid
+// from the directory name. Instead create type "UninitMark(TimelineId)" and only parse it once
+// from the name.
+
+pub fn is_uninit_mark(path: &Utf8Path) -> bool {
     ends_with_suffix(path, TIMELINE_UNINIT_MARK_SUFFIX)
 }
 
-pub fn is_delete_mark(path: &Path) -> bool {
+pub fn is_delete_mark(path: &Utf8Path) -> bool {
     ends_with_suffix(path, TIMELINE_DELETE_MARK_SUFFIX)
 }
 
@@ -182,15 +182,11 @@ fn is_walkdir_io_not_found(e: &walkdir::Error) -> bool {
 /// delaying is needed.
 #[derive(Clone)]
 pub struct InitializationOrder {
+    /// Each initial tenant load task carries this until it is done loading timelines from remote storage
+    pub initial_tenant_load_remote: Option<utils::completion::Completion>,
+
     /// Each initial tenant load task carries this until completion.
     pub initial_tenant_load: Option<utils::completion::Completion>,
-
-    /// Barrier for when we can start initial logical size calculations.
-    pub initial_logical_size_can_start: utils::completion::Barrier,
-
-    /// Each timeline owns a clone of this to be consumed on the initial logical size calculation
-    /// attempt. It is important to drop this once the attempt has completed.
-    pub initial_logical_size_attempt: utils::completion::Completion,
 
     /// Barrier for when we can start any background jobs.
     ///
@@ -211,7 +207,7 @@ async fn timed<Fut: std::future::Future>(
     match tokio::time::timeout(warn_at, &mut fut).await {
         Ok(ret) => {
             tracing::info!(
-                task = name,
+                stage = name,
                 elapsed_ms = started.elapsed().as_millis(),
                 "completed"
             );
@@ -219,52 +215,22 @@ async fn timed<Fut: std::future::Future>(
         }
         Err(_) => {
             tracing::info!(
-                task = name,
+                stage = name,
                 elapsed_ms = started.elapsed().as_millis(),
                 "still waiting, taking longer than expected..."
             );
 
             let ret = fut.await;
 
+            // this has a global allowed_errors
             tracing::warn!(
-                task = name,
+                stage = name,
                 elapsed_ms = started.elapsed().as_millis(),
                 "completed, took longer than expected"
             );
 
             ret
         }
-    }
-}
-
-#[cfg(test)]
-mod backoff_defaults_tests {
-    use super::*;
-
-    #[test]
-    fn backoff_defaults_produce_growing_backoff_sequence() {
-        let mut current_backoff_value = None;
-
-        for i in 0..10_000 {
-            let new_backoff_value = exponential_backoff_duration_seconds(
-                i,
-                DEFAULT_BASE_BACKOFF_SECONDS,
-                DEFAULT_MAX_BACKOFF_SECONDS,
-            );
-
-            if let Some(old_backoff_value) = current_backoff_value.replace(new_backoff_value) {
-                assert!(
-                    old_backoff_value <= new_backoff_value,
-                    "{i}th backoff value {new_backoff_value} is smaller than the previous one {old_backoff_value}"
-                )
-            }
-        }
-
-        assert_eq!(
-            current_backoff_value.expect("Should have produced backoff values to compare"),
-            DEFAULT_MAX_BACKOFF_SECONDS,
-            "Given big enough of retries, backoff should reach its allowed max value"
-        );
     }
 }
 

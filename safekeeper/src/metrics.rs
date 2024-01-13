@@ -11,7 +11,8 @@ use futures::Future;
 use metrics::{
     core::{AtomicU64, Collector, Desc, GenericCounter, GenericGaugeVec, Opts},
     proto::MetricFamily,
-    register_int_counter, register_int_counter_vec, Gauge, IntCounter, IntCounterVec, IntGaugeVec,
+    register_int_counter, register_int_counter_pair_vec, register_int_counter_vec, Gauge,
+    IntCounter, IntCounterPairVec, IntCounterVec, IntGaugeVec,
 };
 use once_cell::sync::Lazy;
 
@@ -20,7 +21,7 @@ use utils::pageserver_feedback::PageserverFeedback;
 use utils::{id::TenantTimelineId, lsn::Lsn};
 
 use crate::{
-    safekeeper::{SafeKeeperState, SafekeeperMemState},
+    state::{TimelineMemState, TimelinePersistentState},
     GlobalTimelines,
 };
 
@@ -89,16 +90,10 @@ pub static BROKER_PULLED_UPDATES: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Failed to register safekeeper_broker_pulled_updates_total counter")
 });
-pub static PG_QUERIES_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
+pub static PG_QUERIES_GAUGE: Lazy<IntCounterPairVec> = Lazy::new(|| {
+    register_int_counter_pair_vec!(
         "safekeeper_pg_queries_received_total",
         "Number of queries received through pg protocol",
-        &["query"]
-    )
-    .expect("Failed to register safekeeper_pg_queries_received_total counter")
-});
-pub static PG_QUERIES_FINISHED: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
         "safekeeper_pg_queries_finished_total",
         "Number of queries finished through pg protocol",
         &["query"]
@@ -313,11 +308,10 @@ pub struct FullTimelineInfo {
     pub last_removed_segno: XLogSegNo,
 
     pub epoch_start_lsn: Lsn,
-    pub mem_state: SafekeeperMemState,
-    pub persisted_state: SafeKeeperState,
+    pub mem_state: TimelineMemState,
+    pub persisted_state: TimelinePersistentState,
 
     pub flush_lsn: Lsn,
-    pub remote_consistent_lsn: Lsn,
 
     pub wal_storage: WalStorageMetrics,
 }
@@ -613,7 +607,7 @@ impl Collector for TimelineCollector {
                 .set(tli.mem_state.peer_horizon_lsn.into());
             self.remote_consistent_lsn
                 .with_label_values(labels)
-                .set(tli.remote_consistent_lsn.into());
+                .set(tli.mem_state.remote_consistent_lsn.into());
             self.timeline_active
                 .with_label_values(labels)
                 .set(tli.timeline_is_active as u64);

@@ -21,7 +21,8 @@ use crate::safekeeper::{AcceptorProposerMessage, AppendResponse, ServerInfo};
 use crate::safekeeper::{
     AppendRequest, AppendRequestHeader, ProposerAcceptorMessage, ProposerElected,
 };
-use crate::safekeeper::{SafeKeeperState, Term, TermHistory, TermSwitchEntry};
+use crate::safekeeper::{Term, TermHistory, TermLsn};
+use crate::state::TimelinePersistentState;
 use crate::timeline::Timeline;
 use crate::GlobalTimelines;
 use postgres_backend::PostgresBackend;
@@ -44,8 +45,11 @@ pub struct AppendLogicalMessage {
 
     // fields from AppendRequestHeader
     pub term: Term,
+    #[serde(with = "utils::lsn::serde_as_u64")]
     pub epoch_start_lsn: Lsn,
+    #[serde(with = "utils::lsn::serde_as_u64")]
     pub begin_lsn: Lsn,
+    #[serde(with = "utils::lsn::serde_as_u64")]
     pub truncate_lsn: Lsn,
     pub pg_version: u32,
 }
@@ -53,7 +57,7 @@ pub struct AppendLogicalMessage {
 #[derive(Debug, Serialize)]
 struct AppendResult {
     // safekeeper state after append
-    state: SafeKeeperState,
+    state: TimelinePersistentState,
     // info about new record in the WAL
     inserted_wal: InsertedWAL,
 }
@@ -119,7 +123,7 @@ async fn send_proposer_elected(tli: &Arc<Timeline>, term: Term, lsn: Lsn) -> any
     let history = tli.get_state().await.1.acceptor_state.term_history;
     let history = history.up_to(lsn.checked_sub(1u64).unwrap());
     let mut history_entries = history.0;
-    history_entries.push(TermSwitchEntry { term, lsn });
+    history_entries.push(TermLsn { term, lsn });
     let history = TermHistory(history_entries);
 
     let proposer_elected_request = ProposerAcceptorMessage::Elected(ProposerElected {

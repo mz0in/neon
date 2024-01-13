@@ -1,19 +1,26 @@
 //! A group of high-level tests for connection establishing logic and auth.
-//!
+
+mod mitm;
+
+use super::connect_compute::ConnectMechanism;
+use super::retry::ShouldRetry;
 use super::*;
-use crate::auth::backend::TestBackend;
-use crate::auth::ClientCredentials;
-use crate::console::{CachedNodeInfo, NodeInfo};
+use crate::auth::backend::{ComputeUserInfo, TestBackend};
+use crate::config::CertResolver;
+use crate::console::{self, CachedNodeInfo, NodeInfo};
+use crate::proxy::retry::{retry_after, NUM_RETRIES_CONNECT};
 use crate::{auth, http, sasl, scram};
 use async_trait::async_trait;
 use rstest::rstest;
+use smol_str::SmolStr;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::tls::{MakeTlsConnect, NoTls};
-use tokio_postgres_rustls::MakeRustlsConnect;
+use tokio_postgres_rustls::{MakeRustlsConnect, RustlsStream};
 
 /// Generate a set of TLS certificates: CA + server.
 fn generate_certs(
     hostname: &str,
+    common_name: &str,
 ) -> anyhow::Result<(rustls::Certificate, rustls::Certificate, rustls::PrivateKey)> {
     let ca = rcgen::Certificate::from_params({
         let mut params = rcgen::CertificateParams::default();
@@ -21,7 +28,15 @@ fn generate_certs(
         params
     })?;
 
-    let cert = rcgen::generate_simple_self_signed(vec![hostname.into()])?;
+    let cert = rcgen::Certificate::from_params({
+        let mut params = rcgen::CertificateParams::new(vec![hostname.into()]);
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params
+    })?;
+
     Ok((
         rustls::Certificate(ca.serialize_der()?),
         rustls::Certificate(cert.serialize_der_with_signer(&ca)?),
@@ -37,7 +52,14 @@ struct ClientConfig<'a> {
 impl ClientConfig<'_> {
     fn make_tls_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         self,
-    ) -> anyhow::Result<impl tokio_postgres::tls::TlsConnect<S>> {
+    ) -> anyhow::Result<
+        impl tokio_postgres::tls::TlsConnect<
+            S,
+            Error = impl std::fmt::Debug,
+            Future = impl Send,
+            Stream = RustlsStream<S>,
+        >,
+    > {
         let mut mk = MakeRustlsConnect::new(self.config);
         let tls = MakeTlsConnect::<S>::make_tls_connect(&mut mk, self.hostname)?;
         Ok(tls)
@@ -49,20 +71,24 @@ fn generate_tls_config<'a>(
     hostname: &'a str,
     common_name: &'a str,
 ) -> anyhow::Result<(ClientConfig<'a>, TlsConfig)> {
-    let (ca, cert, key) = generate_certs(hostname)?;
+    let (ca, cert, key) = generate_certs(hostname, common_name)?;
 
     let tls_config = {
         let config = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(vec![cert], key)?
+            .with_single_cert(vec![cert.clone()], key.clone())?
             .into();
 
-        let common_names = Some([common_name.to_owned()].iter().cloned().collect());
+        let mut cert_resolver = CertResolver::new();
+        cert_resolver.add_cert(key, vec![cert], true)?;
+
+        let common_names = cert_resolver.get_common_names();
 
         TlsConfig {
             config,
             common_names,
+            cert_resolver: Arc::new(cert_resolver),
         }
     };
 
@@ -86,8 +112,9 @@ fn generate_tls_config<'a>(
 trait TestAuth: Sized {
     async fn authenticate<S: AsyncRead + AsyncWrite + Unpin + Send>(
         self,
-        _stream: &mut PqStream<Stream<S>>,
+        stream: &mut PqStream<Stream<S>>,
     ) -> anyhow::Result<()> {
+        stream.write_message_noflush(&Be::AuthenticationOk)?;
         Ok(())
     }
 }
@@ -137,6 +164,7 @@ async fn dummy_proxy(
     auth: impl TestAuth + Send,
 ) -> anyhow::Result<()> {
     let cancel_map = CancelMap::default();
+    let client = WithClientIp::new(client);
     let (mut stream, _params) = handshake(client, tls.as_ref(), &cancel_map)
         .await?
         .context("handshake failed")?;
@@ -144,7 +172,6 @@ async fn dummy_proxy(
     auth.authenticate(&mut stream).await?;
 
     stream
-        .write_message_noflush(&Be::AuthenticationOk)?
         .write_message_noflush(&Be::CLIENT_ENCODING)?
         .write_message(&Be::ReadyForQuery)
         .await?;
@@ -252,9 +279,34 @@ async fn scram_auth_good(#[case] password: &str) -> anyhow::Result<()> {
     ));
 
     let (_client, _conn) = tokio_postgres::Config::new()
+        .channel_binding(tokio_postgres::config::ChannelBinding::Require)
         .user("user")
         .dbname("db")
         .password(password)
+        .ssl_mode(SslMode::Require)
+        .connect_raw(server, client_config.make_tls_connect()?)
+        .await?;
+
+    proxy.await?
+}
+
+#[tokio::test]
+async fn scram_auth_disable_channel_binding() -> anyhow::Result<()> {
+    let (client, server) = tokio::io::duplex(1024);
+
+    let (client_config, server_config) =
+        generate_tls_config("generic-project-name.localhost", "localhost")?;
+    let proxy = tokio::spawn(dummy_proxy(
+        client,
+        Some(server_config),
+        Scram::new("password")?,
+    ));
+
+    let (_client, _conn) = tokio_postgres::Config::new()
+        .channel_binding(tokio_postgres::config::ChannelBinding::Disable)
+        .user("user")
+        .dbname("db")
+        .password("password")
         .ssl_mode(SslMode::Require)
         .connect_raw(server, client_config.make_tls_connect()?)
         .await?;
@@ -302,7 +354,7 @@ async fn scram_auth_mock() -> anyhow::Result<()> {
 #[test]
 fn connect_compute_total_wait() {
     let mut total_wait = tokio::time::Duration::ZERO;
-    for num_retries in 1..10 {
+    for num_retries in 1..NUM_RETRIES_CONNECT {
         total_wait += retry_after(num_retries);
     }
     assert!(total_wait < tokio::time::Duration::from_secs(12));
@@ -374,8 +426,9 @@ impl ConnectMechanism for TestConnectMechanism {
 
     async fn connect_once(
         &self,
+        _ctx: &mut RequestMonitoring,
         _node_info: &console::CachedNodeInfo,
-        _timeout: time::Duration,
+        _timeout: std::time::Duration,
     ) -> Result<Self::Connection, Self::ConnectError> {
         let mut counter = self.counter.lock().unwrap();
         let action = self.sequence[*counter];
@@ -408,7 +461,7 @@ impl TestBackend for TestConnectMechanism {
             }
             ConnectAction::WakeRetry => {
                 let err = console::errors::ApiError::Console {
-                    status: http::StatusCode::INTERNAL_SERVER_ERROR,
+                    status: http::StatusCode::BAD_REQUEST,
                     text: "TEST".into(),
                 };
                 assert!(err.could_retry());
@@ -416,6 +469,10 @@ impl TestBackend for TestConnectMechanism {
             }
             x => panic!("expecting action {:?}, wake_compute is called instead", x),
         }
+    }
+
+    fn get_allowed_ips(&self) -> Result<Vec<SmolStr>, console::errors::GetAuthInfoError> {
+        unimplemented!("not used in tests")
     }
 }
 
@@ -430,26 +487,19 @@ fn helper_create_cached_node_info() -> CachedNodeInfo {
 
 fn helper_create_connect_info(
     mechanism: &TestConnectMechanism,
-) -> (
-    CachedNodeInfo,
-    console::ConsoleReqExtra<'static>,
-    auth::BackendType<'_, ClientCredentials<'static>>,
-) {
+) -> (CachedNodeInfo, auth::BackendType<'_, ComputeUserInfo>) {
     let cache = helper_create_cached_node_info();
-    let extra = console::ConsoleReqExtra {
-        session_id: uuid::Uuid::new_v4(),
-        application_name: Some("TEST"),
-    };
-    let creds = auth::BackendType::Test(mechanism);
-    (cache, extra, creds)
+    let user_info = auth::BackendType::Test(mechanism);
+    (cache, user_info)
 }
 
 #[tokio::test]
 async fn connect_to_compute_success() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Connect]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap();
     mechanism.verify();
@@ -458,9 +508,10 @@ async fn connect_to_compute_success() {
 #[tokio::test]
 async fn connect_to_compute_retry() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Retry, Wake, Retry, Connect]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap();
     mechanism.verify();
@@ -470,9 +521,10 @@ async fn connect_to_compute_retry() {
 #[tokio::test]
 async fn connect_to_compute_non_retry_1() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Retry, Wake, Retry, Fail]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap_err();
     mechanism.verify();
@@ -482,9 +534,10 @@ async fn connect_to_compute_non_retry_1() {
 #[tokio::test]
 async fn connect_to_compute_non_retry_2() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Fail, Wake, Retry, Connect]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap();
     mechanism.verify();
@@ -493,14 +546,15 @@ async fn connect_to_compute_non_retry_2() {
 /// Retry for at most `NUM_RETRIES_CONNECT` times.
 #[tokio::test]
 async fn connect_to_compute_non_retry_3() {
-    assert_eq!(NUM_RETRIES_CONNECT, 10);
+    assert_eq!(NUM_RETRIES_CONNECT, 16);
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![
-        Retry, Wake, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry,
-        /* the 11th time */ Retry,
+        Retry, Wake, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry, Retry,
+        Retry, Retry, Retry, Retry, /* the 17th time */ Retry,
     ]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap_err();
     mechanism.verify();
@@ -510,9 +564,10 @@ async fn connect_to_compute_non_retry_3() {
 #[tokio::test]
 async fn wake_retry() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Retry, WakeRetry, Wake, Connect]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap();
     mechanism.verify();
@@ -522,9 +577,10 @@ async fn wake_retry() {
 #[tokio::test]
 async fn wake_non_retry() {
     use ConnectAction::*;
+    let mut ctx = RequestMonitoring::test();
     let mechanism = TestConnectMechanism::new(vec![Retry, WakeFail]);
-    let (cache, extra, creds) = helper_create_connect_info(&mechanism);
-    connect_to_compute(&mechanism, cache, &extra, &creds)
+    let (cache, user_info) = helper_create_connect_info(&mechanism);
+    connect_to_compute(&mut ctx, &mechanism, cache, &user_info)
         .await
         .unwrap_err();
     mechanism.verify();

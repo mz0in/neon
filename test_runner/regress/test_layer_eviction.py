@@ -8,21 +8,20 @@ from fixtures.neon_fixtures import (
 )
 from fixtures.pageserver.utils import wait_for_last_record_lsn, wait_for_upload
 from fixtures.remote_storage import RemoteStorageKind
-from fixtures.types import Lsn, TenantId, TimelineId
+from fixtures.types import Lsn
 from fixtures.utils import query_scalar
 
 
 # Crates a few layers, ensures that we can evict them (removing locally but keeping track of them anyway)
 # and then download them back.
-@pytest.mark.parametrize("remote_storage_kind", [RemoteStorageKind.LOCAL_FS])
 def test_basic_eviction(
     neon_env_builder: NeonEnvBuilder,
-    remote_storage_kind: RemoteStorageKind,
+    build_type: str,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_download_remote_layers_api",
-    )
+    if build_type == "debug":
+        pytest.skip("times out in debug builds")
+
+    neon_env_builder.enable_pageserver_remote_storage(RemoteStorageKind.LOCAL_FS)
 
     env = neon_env_builder.init_start(
         initial_tenant_conf={
@@ -34,8 +33,8 @@ def test_basic_eviction(
     client = env.pageserver.http_client()
     endpoint = env.endpoints.create_start("main")
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
-    timeline_id = TimelineId(endpoint.safe_psql("show neon.timeline_id")[0][0])
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
 
     # Create a number of layers in the tenant
     with endpoint.cursor() as cur:
@@ -58,7 +57,7 @@ def test_basic_eviction(
     for sk in env.safekeepers:
         sk.stop()
 
-    timeline_path = env.timeline_dir(tenant_id, timeline_id)
+    timeline_path = env.pageserver.timeline_dir(tenant_id, timeline_id)
     initial_local_layers = sorted(
         list(filter(lambda path: path.name != "metadata", timeline_path.glob("*")))
     )
@@ -103,9 +102,7 @@ def test_basic_eviction(
         ), f"Did not expect to find {local_layer} layer after evicting"
 
     empty_layers = list(filter(lambda path: path.name != "metadata", timeline_path.glob("*")))
-    assert (
-        not empty_layers
-    ), f"After evicting all layers, timeline {tenant_id}/{timeline_id} should have no layers locally, but got: {empty_layers}"
+    assert not empty_layers, f"After evicting all layers, timeline {tenant_id}/{timeline_id} should have no layers locally, but got: {empty_layers}"
 
     evicted_layer_map_info = client.layer_map_info(tenant_id=tenant_id, timeline_id=timeline_id)
     assert (
@@ -155,10 +152,7 @@ def test_basic_eviction(
 
 
 def test_gc_of_remote_layers(neon_env_builder: NeonEnvBuilder):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=RemoteStorageKind.LOCAL_FS,
-        test_name="test_gc_of_remote_layers",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(RemoteStorageKind.LOCAL_FS)
 
     env = neon_env_builder.init_start()
 
@@ -249,41 +243,41 @@ def test_gc_of_remote_layers(neon_env_builder: NeonEnvBuilder):
     assert by_kind["Image"] > 0
     assert by_kind["Delta"] > 0
     assert by_kind["InMemory"] == 0
-    resident_layers = list(env.timeline_dir(tenant_id, timeline_id).glob("*-*_*"))
+    resident_layers = list(env.pageserver.timeline_dir(tenant_id, timeline_id).glob("*-*_*"))
     log.info("resident layers count before eviction: %s", len(resident_layers))
 
     log.info("evict all layers")
     ps_http.evict_all_layers(tenant_id, timeline_id)
 
     def ensure_resident_and_remote_size_metrics():
-        log.info("ensure that all the layers are gone")
-        resident_layers = list(env.timeline_dir(tenant_id, timeline_id).glob("*-*_*"))
+        resident_layers = list(env.pageserver.timeline_dir(tenant_id, timeline_id).glob("*-*_*"))
         # we have disabled all background loops, so, this should hold
-        assert len(resident_layers) == 0
+        assert len(resident_layers) == 0, "ensure that all the layers are gone"
 
         info = ps_http.layer_map_info(tenant_id, timeline_id)
         log.info("layer map dump: %s", info)
 
-        log.info("ensure that resident_physical_size metric is zero")
         resident_physical_size_metric = ps_http.get_timeline_metric(
             tenant_id, timeline_id, "pageserver_resident_physical_size"
         )
-        assert resident_physical_size_metric == 0
-        log.info("ensure that resident_physical_size metric corresponds to layer map dump")
+        assert (
+            resident_physical_size_metric == 0
+        ), "ensure that resident_physical_size metric is zero"
         assert resident_physical_size_metric == sum(
-            [layer.layer_file_size or 0 for layer in info.historic_layers if not layer.remote]
-        )
+            layer.layer_file_size or 0 for layer in info.historic_layers if not layer.remote
+        ), "ensure that resident_physical_size metric corresponds to layer map dump"
 
-        log.info("ensure that remote_physical_size metric matches layer map")
         remote_physical_size_metric = ps_http.get_timeline_metric(
             tenant_id, timeline_id, "pageserver_remote_physical_size"
         )
-        log.info("ensure that remote_physical_size metric corresponds to layer map dump")
         assert remote_physical_size_metric == sum(
             layer.layer_file_size or 0 for layer in info.historic_layers if layer.remote
-        )
+        ), "ensure that remote_physical_size metric corresponds to layer map dump"
 
     log.info("before runnning GC, ensure that remote_physical size is zero")
+    # leaving index_part.json upload from successful compaction out will show
+    # up here as a mismatch between remove_physical_size and summed up layermap
+    # size
     ensure_resident_and_remote_size_metrics()
 
     log.info("run GC")

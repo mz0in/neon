@@ -8,14 +8,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{anyhow, Context};
 use bytes::BytesMut;
 use chrono::{NaiveDateTime, Utc};
 use fail::fail_point;
 use futures::StreamExt;
 use postgres::{error::SqlState, SimpleQueryMessage, SimpleQueryRow};
-use postgres_ffi::v14::xlog_utils::normalize_lsn;
 use postgres_ffi::WAL_SEGMENT_SIZE;
+use postgres_ffi::{v14::xlog_utils::normalize_lsn, waldecoder::WalDecodeError};
 use postgres_protocol::message::backend::ReplicationMessage;
 use postgres_types::PgLsn;
 use tokio::{select, sync::watch, time};
@@ -26,7 +26,7 @@ use tracing::{debug, error, info, trace, warn, Instrument};
 use super::TaskStateUpdate;
 use crate::{
     context::RequestContext,
-    metrics::{LIVE_CONNECTIONS_COUNT, WALRECEIVER_STARTED_CONNECTIONS},
+    metrics::{LIVE_CONNECTIONS_COUNT, WALRECEIVER_STARTED_CONNECTIONS, WAL_INGEST},
     task_mgr,
     task_mgr::TaskKind,
     task_mgr::WALRECEIVER_RUNTIME,
@@ -60,8 +60,53 @@ pub(super) struct WalConnectionStatus {
     pub node: NodeId,
 }
 
+pub(super) enum WalReceiverError {
+    /// An error of a type that does not indicate an issue, e.g. a connection closing
+    ExpectedSafekeeperError(postgres::Error),
+    /// An "error" message that carries a SUCCESSFUL_COMPLETION status code.  Carries
+    /// the message part of the original postgres error
+    SuccessfulCompletion(String),
+    /// Generic error
+    Other(anyhow::Error),
+}
+
+impl From<tokio_postgres::Error> for WalReceiverError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        if let Some(dberror) = err.as_db_error().filter(|db_error| {
+            db_error.code() == &SqlState::SUCCESSFUL_COMPLETION
+                && db_error.message().contains("ending streaming")
+        }) {
+            // Strip the outer DbError, which carries a misleading "error" severity
+            Self::SuccessfulCompletion(dberror.message().to_string())
+        } else if err.is_closed()
+            || err
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .map(is_expected_io_error)
+                .unwrap_or(false)
+        {
+            Self::ExpectedSafekeeperError(err)
+        } else {
+            Self::Other(anyhow::Error::new(err))
+        }
+    }
+}
+
+impl From<anyhow::Error> for WalReceiverError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(err)
+    }
+}
+
+impl From<WalDecodeError> for WalReceiverError {
+    fn from(err: WalDecodeError) -> Self {
+        Self::Other(anyhow::Error::new(err))
+    }
+}
+
 /// Open a connection to the given safekeeper and receive WAL, sending back progress
 /// messages as we go.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_walreceiver_connection(
     timeline: Arc<Timeline>,
     wal_source_connconf: PgConnectionConfig,
@@ -70,7 +115,8 @@ pub(super) async fn handle_walreceiver_connection(
     connect_timeout: Duration,
     ctx: RequestContext,
     node: NodeId,
-) -> anyhow::Result<()> {
+    ingest_batch_size: u64,
+) -> Result<(), WalReceiverError> {
     debug_assert_current_span_has_tenant_and_timeline_id();
 
     WALRECEIVER_STARTED_CONNECTIONS.inc();
@@ -78,7 +124,7 @@ pub(super) async fn handle_walreceiver_connection(
     // Connect to the database in replication mode.
     info!("connecting to {wal_source_connconf:?}");
 
-    let (mut replication_client, connection) = {
+    let (replication_client, connection) = {
         let mut config = wal_source_connconf.to_tokio_postgres_config();
         config.application_name("pageserver");
         config.replication_mode(tokio_postgres::config::ReplicationMode::Physical);
@@ -119,7 +165,7 @@ pub(super) async fn handle_walreceiver_connection(
     task_mgr::spawn(
         WALRECEIVER_RUNTIME.handle(),
         TaskKind::WalReceiverConnectionPoller,
-        Some(timeline.tenant_id),
+        Some(timeline.tenant_shard_id),
         Some(timeline.timeline_id),
         "walreceiver connection",
         false,
@@ -130,11 +176,15 @@ pub(super) async fn handle_walreceiver_connection(
                 connection_result = connection => match connection_result {
                     Ok(()) => debug!("Walreceiver db connection closed"),
                     Err(connection_error) => {
-                        if connection_error.is_expected() {
-                            // silence, because most likely we've already exited the outer call
-                            // with a similar error.
-                        } else {
-                            warn!("Connection aborted: {connection_error:#}")
+                        match WalReceiverError::from(connection_error) {
+                            WalReceiverError::ExpectedSafekeeperError(_) => {
+                                // silence, because most likely we've already exited the outer call
+                                // with a similar error.
+                            },
+                            WalReceiverError::SuccessfulCompletion(_) => {}
+                            WalReceiverError::Other(err) => {
+                                warn!("Connection aborted: {err:#}")
+                            }
                         }
                     }
                 },
@@ -157,7 +207,7 @@ pub(super) async fn handle_walreceiver_connection(
         gauge.dec();
     }
 
-    let identify = identify_system(&mut replication_client).await?;
+    let identify = identify_system(&replication_client).await?;
     info!("{identify:?}");
 
     let end_of_wal = Lsn::from(u64::from(identify.xlogpos));
@@ -180,7 +230,7 @@ pub(super) async fn handle_walreceiver_connection(
     let mut startpoint = last_rec_lsn;
 
     if startpoint == Lsn(0) {
-        bail!("No previous WAL position");
+        return Err(WalReceiverError::Other(anyhow!("No previous WAL position")));
     }
 
     // There might be some padding after the last full record, skip it.
@@ -257,21 +307,51 @@ pub(super) async fn handle_walreceiver_connection(
 
                 {
                     let mut decoded = DecodedWALRecord::default();
-                    let mut modification = timeline.begin_modification(endlsn);
+                    let mut modification = timeline.begin_modification(startlsn);
+                    let mut uncommitted_records = 0;
+                    let mut filtered_records = 0;
                     while let Some((lsn, recdata)) = waldecoder.poll_decode()? {
                         // It is important to deal with the aligned records as lsn in getPage@LSN is
                         // aligned and can be several bytes bigger. Without this alignment we are
                         // at risk of hitting a deadlock.
-                        ensure!(lsn.is_aligned());
+                        if !lsn.is_aligned() {
+                            return Err(WalReceiverError::Other(anyhow!("LSN not aligned")));
+                        }
 
-                        walingest
+                        // Ingest the records without immediately committing them.
+                        let ingested = walingest
                             .ingest_record(recdata, lsn, &mut modification, &mut decoded, &ctx)
                             .await
                             .with_context(|| format!("could not ingest record at {lsn}"))?;
+                        if !ingested {
+                            tracing::debug!("ingest: filtered out record @ LSN {lsn}");
+                            WAL_INGEST.records_filtered.inc();
+                            filtered_records += 1;
+                        }
 
                         fail_point!("walreceiver-after-ingest");
 
                         last_rec_lsn = lsn;
+
+                        // Commit every ingest_batch_size records. Even if we filtered out
+                        // all records, we still need to call commit to advance the LSN.
+                        uncommitted_records += 1;
+                        if uncommitted_records >= ingest_batch_size {
+                            WAL_INGEST
+                                .records_committed
+                                .inc_by(uncommitted_records - filtered_records);
+                            modification.commit(&ctx).await?;
+                            uncommitted_records = 0;
+                            filtered_records = 0;
+                        }
+                    }
+
+                    // Commit the remaining records.
+                    if uncommitted_records > 0 {
+                        WAL_INGEST
+                            .records_committed
+                            .inc_by(uncommitted_records - filtered_records);
+                        modification.commit(&ctx).await?;
                     }
                 }
 
@@ -320,8 +400,9 @@ pub(super) async fn handle_walreceiver_connection(
             })?;
 
         if let Some(last_lsn) = status_update {
-            let timeline_remote_consistent_lsn =
-                timeline.get_remote_consistent_lsn().unwrap_or(Lsn(0));
+            let timeline_remote_consistent_lsn = timeline
+                .get_remote_consistent_lsn_visible()
+                .unwrap_or(Lsn(0));
 
             // The last LSN we processed. It is not guaranteed to survive pageserver crash.
             let last_received_lsn = last_lsn;
@@ -345,11 +426,15 @@ pub(super) async fn handle_walreceiver_connection(
 
             // Send the replication feedback message.
             // Regular standby_status_update fields are put into this message.
-            let (timeline_logical_size, _) = timeline
-                .get_current_logical_size(&ctx)
-                .context("Status update creation failed to get current logical size")?;
+            let current_timeline_size = timeline
+                .get_current_logical_size(
+                    crate::tenant::timeline::GetLogicalSizePriority::User,
+                    &ctx,
+                )
+                // FIXME: https://github.com/neondatabase/neon/issues/5963
+                .size_dont_care_about_accuracy();
             let status_update = PageserverFeedback {
-                current_timeline_size: timeline_logical_size,
+                current_timeline_size,
                 last_received_lsn,
                 disk_consistent_lsn,
                 remote_consistent_lsn,
@@ -393,7 +478,7 @@ struct IdentifySystem {
 struct IdentifyError;
 
 /// Run the postgres `IDENTIFY_SYSTEM` command
-async fn identify_system(client: &mut Client) -> anyhow::Result<IdentifySystem> {
+async fn identify_system(client: &Client) -> anyhow::Result<IdentifySystem> {
     let query_str = "IDENTIFY_SYSTEM";
     let response = client.simple_query(query_str).await?;
 
@@ -408,7 +493,7 @@ async fn identify_system(client: &mut Client) -> anyhow::Result<IdentifySystem> 
 
     // extract the row contents into an IdentifySystem struct.
     // written as a closure so I can use ? for Option here.
-    if let Some(SimpleQueryMessage::Row(first_row)) = response.get(0) {
+    if let Some(SimpleQueryMessage::Row(first_row)) = response.first() {
         Ok(IdentifySystem {
             systemid: get_parse(first_row, 0)?,
             timeline: get_parse(first_row, 1)?,
@@ -417,53 +502,5 @@ async fn identify_system(client: &mut Client) -> anyhow::Result<IdentifySystem> 
         })
     } else {
         Err(IdentifyError.into())
-    }
-}
-
-/// Trait for avoid reporting walreceiver specific expected or "normal" or "ok" errors.
-pub(super) trait ExpectedError {
-    /// Test if this error is an ok error.
-    ///
-    /// We don't want to report connectivity problems as real errors towards connection manager because
-    /// 1. they happen frequently enough to make server logs hard to read and
-    /// 2. the connection manager can retry other safekeeper.
-    ///
-    /// If this function returns `true`, it's such an error.
-    /// The caller should log it at info level and then report to connection manager that we're done handling this connection.
-    /// Connection manager will then handle reconnections.
-    ///
-    /// If this function returns an `false` the error should be propagated and the connection manager
-    /// will log the error at ERROR level.
-    fn is_expected(&self) -> bool;
-}
-
-impl ExpectedError for postgres::Error {
-    fn is_expected(&self) -> bool {
-        self.is_closed()
-            || self
-                .source()
-                .and_then(|source| source.downcast_ref::<std::io::Error>())
-                .map(is_expected_io_error)
-                .unwrap_or(false)
-            || self
-                .as_db_error()
-                .filter(|db_error| {
-                    db_error.code() == &SqlState::SUCCESSFUL_COMPLETION
-                        && db_error.message().contains("ending streaming")
-                })
-                .is_some()
-    }
-}
-
-impl ExpectedError for anyhow::Error {
-    fn is_expected(&self) -> bool {
-        let head = self.downcast_ref::<postgres::Error>();
-
-        let tail = self
-            .chain()
-            .filter_map(|e| e.downcast_ref::<postgres::Error>());
-
-        // check if self or any of the chained/sourced errors are expected
-        head.into_iter().chain(tail).any(|e| e.is_expected())
     }
 }
