@@ -315,6 +315,7 @@ if (require.main === module) {
         report: {
             reportUrl: htmlUrl,
             reportJsonUrl: jsonUrl,
+            reportJsonUrl: jsonUrl,
         }
     })
 }
