@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS results (
     status       TEXT NOT NULL,
     started_at   TIMESTAMPTZ NOT NULL,
     stopped_at   TIMESTAMPTZ NOT NULL,
-    duration     INT NOT NULL,
+    error_code  TEXT,
     flaky        BOOLEAN NOT NULL,
     build_type   TEXT NOT NULL,
     pg_version   INT NOT NULL,
