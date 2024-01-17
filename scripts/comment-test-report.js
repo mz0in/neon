@@ -75,7 +75,7 @@ const parseReportJson = async ({ reportJsonUrl, fetch }) => {
 
                 // Removing build type and PostgreSQL version from the test name to make it shorter
                 const testName = test.name.replace(new RegExp(`${buildType}-pg${pgVersion}-?`), "").replace("[]", "")
-                test.pytestName = `${parentSuite.name.replace(".", "/")}/${suite.name}.py::${testName}`
+                test.file = test.pytestName = `${parentSuite.name.replace(".", "/")}/${suite.name}.py::${testName}`
                 test.pgVersion = pgVersion
                 test.buildType = buildType
 
