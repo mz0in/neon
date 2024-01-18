@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+# relevant_files: scripts/ingest_regress_test_result-new-format.py
+
 import argparse
 import dataclasses
 import json
@@ -7,6 +9,10 @@ import logging
 import os
 import re
 import sys
+import backoff
+import psycopg2
+from psycopg2.extras import execute_values
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -103,6 +109,8 @@ def parse_test_name(test_name: str) -> Tuple[str, int, str]:
 
     return build_type, pg_version, unparametrized_name
 
+
+@backoff.on_exception(backoff.expo, psycopg2.OperationalError, max_time=150)
 
 def ingest_test_result(
     cur,
