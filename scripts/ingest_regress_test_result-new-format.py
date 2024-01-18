@@ -7,6 +7,10 @@ import logging
 import os
 import re
 import sys
+import backoff
+import psycopg2
+from psycopg2.extras import execute_values
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
